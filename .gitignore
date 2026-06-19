@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Runtime / scratch (may contain local paths, prompts, or quota data)
+server_run.log
+srv.out
+srv.err
+*.log
+
+# Local conversation databases (never commit — contain prompts/responses)
+*.db
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
