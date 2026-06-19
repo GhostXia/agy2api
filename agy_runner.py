@@ -81,9 +81,22 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
 
     return AgyRunResult(
         db_path=db_path,
-        response=read_response(db_path),
+        response=_read_response_with_retry(db_path),
         stderr=completed.stderr,
     )
+
+
+def _read_response_with_retry(db_path: Path) -> AgResponse:
+    """Read the response, tolerating a brief lag between agy's process exit and
+    the final completed model row being flushed to the conversation DB."""
+    deadline = time.time() + 3.0
+    while True:
+        try:
+            return read_response(db_path)
+        except ValueError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.2)
 
 
 async def run_agy_async(prompt: str, model: str | None = None) -> AgyRunResult:
