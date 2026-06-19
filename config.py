@@ -78,9 +78,10 @@ class Settings:
     # Safety: refuse to bind a non-loopback address unless explicitly allowed.
     # Exposing this endpoint shares your personal Google quota with others.
     allow_remote: bool = _bool_env("AGY2API_ALLOW_REMOTE", False)
-    # Serialize agy runs. Concurrency 1 also avoids the "newest DB" race when
-    # two agy subprocesses write conversation databases at the same time.
-    max_concurrency: int = int(os.getenv("AGY2API_MAX_CONCURRENCY", "1"))
+    # Concurrent agy runs. Safe now that each run reads its OWN conversation DB
+    # (resolved from the per-run --log-file conversation id), not the newest by
+    # mtime. Kept modest to stay human-paced / avoid abuse-like quota bursts.
+    max_concurrency: int = int(os.getenv("AGY2API_MAX_CONCURRENCY", "3"))
     conversations_dir: Path = Path(
         os.getenv(
             "AGY_CONVERSATIONS_DIR",

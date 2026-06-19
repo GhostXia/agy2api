@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,51 +42,87 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
 
     before = _snapshot_conversations(settings.conversations_dir)
 
+    # Per-run unique log file. agy logs its conversation UUID there, and the
+    # conversation DB is named "<uuid>.db" — so we read exactly THIS run's DB
+    # instead of guessing by newest mtime. That makes concurrent runs safe (no
+    # cross-talk between requests racing for the same "newest" database).
+    log_fd, log_path = tempfile.mkstemp(prefix="agy2api-", suffix=".log")
+    os.close(log_fd)
+
     # The prompt is fed via stdin (with an empty --print value) instead of as a
     # command-line argument. agy concatenates stdin into the prompt, and stdin
     # has no length limit, avoiding the Windows ~32767-char command-line cap that
     # raises WinError 206 for long prompts (system + history).
-    command = [settings.agy_path, "--print", ""]
+    command = [settings.agy_path, "--print", "", "--log-file", log_path]
     if model:
         command.extend(["--model", model])
 
     try:
-        completed = subprocess.run(
-            command,
-            cwd=workdir,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=settings.request_timeout,
-            check=False,
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=workdir,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=settings.request_timeout,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            winerror = getattr(exc, "winerror", None)
+            diag = (
+                f"agy launch failed (winerror={winerror}); "
+                f"exe={settings.agy_path!r} exists={Path(settings.agy_path).exists()}; "
+                f"cwd={str(workdir)!r} exists={workdir.exists()}; "
+                f"exc_filename={getattr(exc, 'filename', None)!r}"
+            )
+            raise RuntimeError(diag) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"agy timed out after {settings.request_timeout:g}s") from exc
+
+        if completed.returncode != 0:
+            details = completed.stderr.strip() or completed.stdout.strip() or "no output"
+            raise RuntimeError(f"agy exited with code {completed.returncode}: {details}")
+
+        db_path = _db_from_log(log_path)
+        if db_path is None:
+            # Fallback: log gave no conversation id (older agy?) — pick newest new DB.
+            db_path = _find_new_conversation_db(settings.conversations_dir, before, start_time)
+        if db_path is None:
+            raise RuntimeError("agy completed but no new conversation database was found")
+
+        return AgyRunResult(
+            db_path=db_path,
+            response=_read_response_with_retry(db_path),
+            stderr=completed.stderr,
         )
-    except FileNotFoundError as exc:
-        winerror = getattr(exc, "winerror", None)
-        diag = (
-            f"agy launch failed (winerror={winerror}); "
-            f"exe={settings.agy_path!r} exists={Path(settings.agy_path).exists()}; "
-            f"cwd={str(workdir)!r} exists={workdir.exists()}; "
-            f"exc_filename={getattr(exc, 'filename', None)!r}"
-        )
-        raise RuntimeError(diag) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"agy timed out after {settings.request_timeout:g}s") from exc
+    finally:
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
 
-    if completed.returncode != 0:
-        details = completed.stderr.strip() or completed.stdout.strip() or "no output"
-        raise RuntimeError(f"agy exited with code {completed.returncode}: {details}")
 
-    db_path = _find_new_conversation_db(settings.conversations_dir, before, start_time)
-    if db_path is None:
-        raise RuntimeError("agy completed but no new conversation database was found")
+_CONVERSATION_ID_RE = re.compile(
+    r"conversation[\"=:\s]+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
 
-    return AgyRunResult(
-        db_path=db_path,
-        response=_read_response_with_retry(db_path),
-        stderr=completed.stderr,
-    )
+
+def _db_from_log(log_path: str) -> Path | None:
+    """Map this run's agy log to its conversation DB via the logged UUID.
+    Returns the DB path (named "<uuid>.db") or None if no id is found."""
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    ids = _CONVERSATION_ID_RE.findall(text)
+    if not ids:
+        return None
+    candidate = settings.conversations_dir / f"{ids[-1]}.db"
+    return candidate if candidate.exists() else None
 
 
 def _read_response_with_retry(db_path: Path) -> AgResponse:
