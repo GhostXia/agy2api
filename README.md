@@ -88,4 +88,4 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 
 ## License
 
-MIT. This project is written from scratch and does not copy `gcli2api` code.
+Apache-2.0. This project is written from scratch and does not copy `gcli2api` code.
