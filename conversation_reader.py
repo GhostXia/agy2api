@@ -25,10 +25,13 @@ class AgResponse:
 
 def read_response(db_path: str | Path) -> AgResponse:
     path = Path(db_path)
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(path)
+    try:
         rows = conn.execute(
             "SELECT idx, step_type, status, step_payload FROM steps ORDER BY idx"
         ).fetchall()
+    finally:
+        conn.close()
 
     tool_summaries = _extract_tool_summaries(rows)
     model_rows = [
@@ -54,7 +57,8 @@ def read_response(db_path: str | Path) -> AgResponse:
 
 def read_user_prompt(db_path: str | Path) -> str:
     path = Path(db_path)
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(path)
+    try:
         rows = conn.execute(
             """
             SELECT step_payload
@@ -64,6 +68,8 @@ def read_user_prompt(db_path: str | Path) -> str:
             """,
             (USER_STEP_TYPE, DONE_STATUS),
         ).fetchall()
+    finally:
+        conn.close()
 
     for (payload,) in rows:
         if not isinstance(payload, bytes):

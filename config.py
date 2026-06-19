@@ -82,6 +82,11 @@ class Settings:
     # (resolved from the per-run --log-file conversation id), not the newest by
     # mtime. Kept modest to stay human-paced / avoid abuse-like quota bursts.
     max_concurrency: int = int(os.getenv("AGY2API_MAX_CONCURRENCY", "3"))
+    # Stateless wrapper: full history is resent in each prompt, so a finished
+    # run's conversation DB + brain/ dir are throwaway. Delete them after a
+    # successful read to keep local session files from piling up. Set false to
+    # retain them for debugging. (Does NOT reduce server-side conversation count.)
+    cleanup_db: bool = _bool_env("AGY2API_CLEANUP_DB", True)
     conversations_dir: Path = Path(
         os.getenv(
             "AGY_CONVERSATIONS_DIR",

@@ -93,9 +93,15 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
         if db_path is None:
             raise RuntimeError("agy completed but no new conversation database was found")
 
+        response = _read_response_with_retry(db_path)
+        # Throwaway in stateless mode — drop the run's local artifacts so session
+        # files don't accumulate. Only after a successful read (keep on failure
+        # for debugging).
+        if settings.cleanup_db:
+            _cleanup_conversation(db_path)
         return AgyRunResult(
             db_path=db_path,
-            response=_read_response_with_retry(db_path),
+            response=response,
             stderr=completed.stderr,
         )
     finally:
@@ -111,18 +117,49 @@ _CONVERSATION_ID_RE = re.compile(
 )
 
 
+def _cleanup_conversation(db_path: Path) -> None:
+    """Remove a finished run's local artifacts: the conversation DB and its
+    sibling brain/<id>/ directory. Best-effort; never raises.
+
+    The DB stays briefly locked right after agy exits (Windows handle/flush
+    lag), so retry the unlink for a short window before giving up."""
+    deadline = time.time() + 3.0
+    while True:
+        try:
+            db_path.unlink()
+            break
+        except FileNotFoundError:
+            break
+        except OSError:
+            if time.time() >= deadline:
+                break
+            time.sleep(0.2)
+    brain_dir = db_path.parent.parent / "brain" / db_path.stem
+    if brain_dir.is_dir():
+        shutil.rmtree(brain_dir, ignore_errors=True)
+
+
 def _db_from_log(log_path: str) -> Path | None:
-    """Map this run's agy log to its conversation DB via the logged UUID.
-    Returns the DB path (named "<uuid>.db") or None if no id is found."""
-    try:
-        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    ids = _CONVERSATION_ID_RE.findall(text)
-    if not ids:
-        return None
-    candidate = settings.conversations_dir / f"{ids[-1]}.db"
-    return candidate if candidate.exists() else None
+    """Map this run's agy log to its conversation DB via the logged UUID, named
+    "<uuid>.db". The DB file can appear a beat after the id is logged, so poll
+    for it (deterministic per-run filename — safe under concurrency)."""
+    log_file = Path(log_path)
+    deadline = time.time() + max(2.0, settings.poll_interval * 8)
+    candidate: Path | None = None
+    while time.time() <= deadline:
+        if candidate is None:
+            try:
+                ids = _CONVERSATION_ID_RE.findall(
+                    log_file.read_text(encoding="utf-8", errors="replace")
+                )
+            except OSError:
+                ids = []
+            if ids:
+                candidate = settings.conversations_dir / f"{ids[-1]}.db"
+        if candidate is not None and _looks_ready(candidate):
+            return candidate
+        time.sleep(settings.poll_interval)
+    return candidate if candidate is not None and _looks_ready(candidate) else None
 
 
 def _read_response_with_retry(db_path: Path) -> AgResponse:
