@@ -82,28 +82,36 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"agy timed out after {settings.request_timeout:g}s") from exc
 
-        if completed.returncode != 0:
-            details = completed.stderr.strip() or completed.stdout.strip() or "no output"
-            raise RuntimeError(f"agy exited with code {completed.returncode}: {details}")
-
+        # Attempt to read the conversation DB *before* checking returncode.
+        # When agy is killed mid-generation (returncode -1 on Windows, agy-side
+        # timeout, external process kill), the DB may contain a partial response
+        # (status=2) that conversation_reader can degrade-read into usable text.
+        # Skipping the DB on non-zero exit was the original blank-response bug.
         db_path = _db_from_log(log_path)
         if db_path is None:
             # Fallback: log gave no conversation id (older agy?) — pick newest new DB.
             db_path = _find_new_conversation_db(settings.conversations_dir, before, start_time)
-        if db_path is None:
-            raise RuntimeError("agy completed but no new conversation database was found")
 
-        response = _read_response_with_retry(db_path)
-        # Throwaway in stateless mode — drop the run's local artifacts so session
-        # files don't accumulate. Only after a successful read (keep on failure
-        # for debugging).
-        if settings.cleanup_db:
-            _cleanup_conversation(db_path)
-        return AgyRunResult(
-            db_path=db_path,
-            response=response,
-            stderr=completed.stderr,
-        )
+        if db_path is not None:
+            response = _read_response_with_retry(db_path)
+            # On clean exit + cleanup enabled, discard local artifacts.
+            # On abnormal exit, keep DB for debugging even if cleanup is on.
+            if settings.cleanup_db and completed.returncode == 0 and not response.truncated:
+                _cleanup_conversation(db_path)
+            return AgyRunResult(
+                db_path=db_path,
+                response=response,
+                stderr=completed.stderr,
+            )
+
+        # No DB found at all — now report the exit status.
+        if completed.returncode != 0:
+            details = completed.stderr.strip() or completed.stdout.strip() or "no output"
+            raise RuntimeError(
+                f"agy exited with code {completed.returncode}: {details} "
+                f"(no conversation DB found; possible agy-side timeout or crash)"
+            )
+        raise RuntimeError("agy completed but no new conversation database was found")
     finally:
         try:
             os.remove(log_path)

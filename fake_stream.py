@@ -22,7 +22,7 @@ def split_text(text: str, size: int | None = None) -> list[str]:
     return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)]
 
 
-def build_chunks(answer: str, reasoning: str, model: str) -> list[dict]:
+def build_chunks(answer: str, reasoning: str, model: str, finish_reason: str = "stop") -> list[dict]:
     cid = completion_id()
     created = int(time.time())
     chunks: list[dict] = [
@@ -45,7 +45,7 @@ def build_chunks(answer: str, reasoning: str, model: str) -> list[dict]:
     for piece in answer_pieces:
         chunks.append(_chunk(cid, created, model, {"content": piece}, None))
 
-    chunks.append(_chunk(cid, created, model, {}, "stop"))
+    chunks.append(_chunk(cid, created, model, {}, finish_reason))
     return chunks
 
 
@@ -61,9 +61,9 @@ def sse_event(data: dict | str) -> bytes:
     return f"data: {payload}\n\n".encode("utf-8")
 
 
-async def stream_chunks(answer: str, reasoning: str, model: str) -> AsyncIterator[bytes]:
+async def stream_chunks(answer: str, reasoning: str, model: str, finish_reason: str = "stop") -> AsyncIterator[bytes]:
     delay = settings.stream_delay
-    for index, chunk in enumerate(build_chunks(answer, reasoning, model)):
+    for index, chunk in enumerate(build_chunks(answer, reasoning, model, finish_reason)):
         yield sse_event(chunk)
         # Drip content chunks so clients render a typing effect instead of one
         # burst. agy has no token-level streaming, so this is cosmetic pacing of

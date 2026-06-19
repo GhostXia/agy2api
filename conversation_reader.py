@@ -21,6 +21,7 @@ class AgResponse:
     reasoning: str = ""
     tool_summaries: tuple[str, ...] = ()
     db_path: str = ""
+    truncated: bool = False
 
 
 def read_response(db_path: str | Path) -> AgResponse:
@@ -39,20 +40,39 @@ def read_response(db_path: str | Path) -> AgResponse:
         for idx, step_type, status, payload in rows
         if step_type == MODEL_STEP_TYPE and status == DONE_STATUS and isinstance(payload, bytes)
     ]
-    if not model_rows:
-        raise ValueError(f"no completed model response found in {path}")
+    if model_rows:
+        _, payload = model_rows[-1]
+        answer, reasoning = _extract_model_response(payload)
+        if not answer and not reasoning:
+            raise ValueError(f"model response payload did not contain answer fields in {path}")
+        return AgResponse(
+            answer=answer,
+            reasoning=reasoning,
+            tool_summaries=tuple(tool_summaries),
+            db_path=str(path),
+        )
 
-    _, payload = model_rows[-1]
-    answer, reasoning = _extract_model_response(payload)
-    if not answer and not reasoning:
-        raise ValueError(f"model response payload did not contain answer fields in {path}")
+    # Degraded read: agy may have been killed mid-generation (e.g. Windows
+    # external kill, agy-side timeout).  A status=2 (in-progress) row can
+    # contain partial text that is still better than a blank error response.
+    incomplete_rows = [
+        (idx, payload)
+        for idx, step_type, status, payload in rows
+        if step_type == MODEL_STEP_TYPE and isinstance(payload, bytes)
+    ]
+    if incomplete_rows:
+        _, payload = incomplete_rows[-1]
+        answer, reasoning = _extract_model_response(payload)
+        if answer or reasoning:
+            return AgResponse(
+                answer=answer,
+                reasoning=reasoning,
+                tool_summaries=tuple(tool_summaries),
+                db_path=str(path),
+                truncated=True,
+            )
 
-    return AgResponse(
-        answer=answer,
-        reasoning=reasoning,
-        tool_summaries=tuple(tool_summaries),
-        db_path=str(path),
-    )
+    raise ValueError(f"no model response found in {path}")
 
 
 def read_user_prompt(db_path: str | Path) -> str:

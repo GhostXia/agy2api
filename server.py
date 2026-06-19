@@ -68,11 +68,13 @@ async def chat_completions(
     except Exception as exc:
         return _error_response(str(exc), status_code=500)
 
+    fr = "length" if result.response.truncated else "stop"
     return JSONResponse(
         content=build_completion_response(
             answer=result.response.answer,
             reasoning=result.response.reasoning,
             model=model,
+            finish_reason=fr,
         )
     )
 
@@ -95,7 +97,8 @@ async def _stream_response(
             await asyncio.sleep(1)
 
         result = await task
-        async for item in stream_chunks(result.response.answer, result.response.reasoning, model):
+        fr = "length" if result.response.truncated else "stop"
+        async for item in stream_chunks(result.response.answer, result.response.reasoning, model, finish_reason=fr):
             yield item
     except Exception as exc:
         yield sse_event({"error": {"message": str(exc), "type": "agy_error"}})
@@ -129,7 +132,7 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def build_completion_response(answer: str, reasoning: str, model: str) -> dict:
+def build_completion_response(answer: str, reasoning: str, model: str, finish_reason: str = "stop") -> dict:
     created = int(time.time())
     message: dict[str, Any] = {"role": "assistant", "content": answer}
     if settings.expose_reasoning and reasoning:
@@ -144,7 +147,7 @@ def build_completion_response(answer: str, reasoning: str, model: str) -> dict:
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
