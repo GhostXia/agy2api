@@ -1,6 +1,6 @@
 # agy2api
 
-MIT-friendly OpenAI-compatible wrapper around the logged-in official Antigravity CLI.
+OpenAI-compatible wrapper around the logged-in official Antigravity CLI.
 
 ## What It Does
 
