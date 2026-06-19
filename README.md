@@ -37,6 +37,27 @@ official CLI yourself before running it:
   `HOST=0.0.0.0` / expose it publicly unless you set a strong `AGY2API_KEY` and
   accept that callers run prompts under your Google account.
 
+## Compliance / Acceptable Use
+
+This is an **unofficial** personal-interop tool. It is not affiliated with,
+endorsed by, or supported by Google. You are responsible for using it within
+the Antigravity / Gemini Terms of Service. To stay on the safe side:
+
+- **Personal, local, single-user only.** Do not share the endpoint, share the
+  Bearer key, or run it as a public proxy. Doing so redistributes your personal
+  Google quota to third parties — the clearest ToS violation.
+- **No commercial use or resale** of the free-tier quota.
+- **Do not expose it to the network.** The server refuses to bind a non-loopback
+  address unless you set `AGY2API_ALLOW_REMOTE=1` (don't, unless you fully
+  understand the consequences).
+- **Human-paced volume.** Concurrency is capped at 1 by default
+  (`AGY2API_MAX_CONCURRENCY`). Don't drive high-volume or mass-parallel traffic.
+- **Don't use outputs to train competing models**, and don't strip safety
+  filtering — pass prompts through as-is.
+- The tool only reads *your own* local conversation database on *your own*
+  machine; it does not break encryption or access anyone else's data. Keep it
+  that way.
+
 ## Install
 
 ```powershell
@@ -62,7 +83,7 @@ Default URL: `http://127.0.0.1:7862`.
 curl http://127.0.0.1:7862/v1/chat/completions \
   -H "Authorization: Bearer pwd" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"reply with exactly PONG"}]}'
+  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"reply with exactly PONG"}]}'
 ```
 
 ## Configuration
@@ -74,9 +95,12 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY2API_KEY`: bearer token, default `pwd` (empty disables auth)
 - `AGY_MODELS`: comma-separated model list
 - `AGY_POLL_INTERVAL`: DB-readiness poll seconds, default `0.25`
-- `AGY2API_CHUNK_SIZE`: fake-stream chunk size in chars, default `50`
+- `AGY2API_CHUNK_SIZE`: fake-stream chunk size in chars, default `10`
+- `AGY2API_STREAM_DELAY`: inter-chunk delay seconds for typing effect, default `0.03`
 - `AGY2API_EXPOSE_REASONING`: emit `reasoning_content`, default `true`
-- `HOST`: bind address, default `127.0.0.1` (see Auth & Privacy)
+- `AGY2API_MAX_CONCURRENCY`: max concurrent agy runs, default `1`
+- `AGY2API_ALLOW_REMOTE`: allow binding a non-loopback host, default `false`
+- `HOST`: bind address, default `127.0.0.1` (see Auth & Privacy / Compliance)
 - `PORT`: server port, default `7862`
 
 ## Known Limits

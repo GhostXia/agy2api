@@ -75,6 +75,12 @@ class Settings:
     chunk_size: int = int(os.getenv("AGY2API_CHUNK_SIZE", "10"))
     stream_delay: float = float(os.getenv("AGY2API_STREAM_DELAY", "0.03"))
     expose_reasoning: bool = _bool_env("AGY2API_EXPOSE_REASONING", True)
+    # Safety: refuse to bind a non-loopback address unless explicitly allowed.
+    # Exposing this endpoint shares your personal Google quota with others.
+    allow_remote: bool = _bool_env("AGY2API_ALLOW_REMOTE", False)
+    # Serialize agy runs. Concurrency 1 also avoids the "newest DB" race when
+    # two agy subprocesses write conversation databases at the same time.
+    max_concurrency: int = int(os.getenv("AGY2API_MAX_CONCURRENCY", "1"))
     conversations_dir: Path = Path(
         os.getenv(
             "AGY_CONVERSATIONS_DIR",
@@ -95,3 +101,10 @@ class Settings:
 
 
 settings = Settings()
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", ""}
+
+
+def is_loopback_host(host: str) -> bool:
+    return host.strip().lower() in _LOOPBACK_HOSTS

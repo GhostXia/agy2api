@@ -12,13 +12,22 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from agy_runner import run_agy_async
-from config import resolve_model, settings
+from config import is_loopback_host, resolve_model, settings
 from fake_stream import make_heartbeat, sse_event, stream_chunks
 from models import ChatCompletionRequest, ModelInfo, ModelList
 
 
 app = FastAPI(title="agy2api", version="0.1.0")
 security = HTTPBearer(auto_error=False)
+
+# Limit concurrent agy runs (default 1) to mimic human-paced usage and avoid the
+# concurrent conversation-DB race. See config.max_concurrency.
+_run_semaphore = asyncio.Semaphore(max(1, settings.max_concurrency))
+
+
+async def _run_agy_guarded(prompt: str, model: str | None):
+    async with _run_semaphore:
+        return await run_agy_async(prompt, model)
 
 
 async def verify_token(
@@ -55,7 +64,7 @@ async def chat_completions(
         )
 
     try:
-        result = await run_agy_async(prompt, agy_model)
+        result = await _run_agy_guarded(prompt, agy_model)
     except Exception as exc:
         return _error_response(str(exc), status_code=500)
 
@@ -76,7 +85,7 @@ async def health() -> dict[str, str]:
 async def _stream_response(
     prompt: str, model: str, agy_model: str | None, request: Request
 ) -> AsyncIterator[bytes]:
-    task = asyncio.create_task(run_agy_async(prompt, agy_model))
+    task = asyncio.create_task(_run_agy_guarded(prompt, agy_model))
     try:
         while not task.done():
             if await request.is_disconnected():
@@ -153,7 +162,24 @@ def _error_response(message: str, status_code: int) -> JSONResponse:
     )
 
 
+def _enforce_bind_safety() -> None:
+    if is_loopback_host(settings.host) or settings.allow_remote:
+        return
+    import sys
+
+    sys.stderr.write(
+        f"\nRefusing to bind non-loopback host {settings.host!r}.\n"
+        "Exposing this endpoint shares your personal Google quota with anyone\n"
+        "who can reach it. For personal/local use keep HOST=127.0.0.1.\n"
+        "If you truly intend remote access, set AGY2API_ALLOW_REMOTE=1 and a\n"
+        "strong AGY2API_KEY, and accept that callers run prompts under your\n"
+        "Google account.\n"
+    )
+    sys.exit(2)
+
+
 if __name__ == "__main__":
     import uvicorn
 
+    _enforce_bind_safety()
     uvicorn.run("server:app", host=settings.host, port=settings.port, reload=False)
