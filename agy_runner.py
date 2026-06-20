@@ -53,7 +53,16 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
     # command-line argument. agy concatenates stdin into the prompt, and stdin
     # has no length limit, avoiding the Windows ~32767-char command-line cap that
     # raises WinError 206 for long prompts (system + history).
-    command = [settings.agy_path, "--print", "", "--log-file", log_path]
+    # Give agy its OWN print-timeout equal to our budget, and let our subprocess
+    # timeout sit a margin ABOVE it. That way agy hits its timeout first and
+    # flushes whatever partial response it has (degrade-readable) instead of us
+    # hard-killing it and truncating long replies.
+    command = [
+        settings.agy_path,
+        "--print", "",
+        "--log-file", log_path,
+        "--print-timeout", f"{int(settings.request_timeout)}s",
+    ]
     if model:
         command.extend(["--model", model])
 
@@ -67,7 +76,7 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=settings.request_timeout,
+                timeout=settings.request_timeout + 20,
                 check=False,
             )
         except FileNotFoundError as exc:

@@ -70,7 +70,7 @@ class Settings:
     api_key: str = os.getenv("AGY2API_KEY", os.getenv("API_KEY", "pwd"))
     host: str = os.getenv("HOST", "127.0.0.1")
     port: int = int(os.getenv("PORT", "7862"))
-    request_timeout: float = float(os.getenv("AGY_TIMEOUT", "180"))
+    request_timeout: float = float(os.getenv("AGY_TIMEOUT", "300"))
     poll_interval: float = float(os.getenv("AGY_POLL_INTERVAL", "0.25"))
     chunk_size: int = int(os.getenv("AGY2API_CHUNK_SIZE", "10"))
     stream_delay: float = float(os.getenv("AGY2API_STREAM_DELAY", "0.03"))

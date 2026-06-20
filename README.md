@@ -91,7 +91,7 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY_PATH`: CLI executable path, default `agy`
 - `AGY_WORKDIR`: working directory for `agy`, default project parent
 - `AGY_CONVERSATIONS_DIR`: Antigravity conversations directory
-- `AGY_TIMEOUT`: subprocess timeout seconds, default `180`
+- `AGY_TIMEOUT`: per-request budget seconds, default `300` (also passed to agy as `--print-timeout`; the subprocess is killed only 20s later as a hard backstop)
 - `AGY2API_KEY`: bearer token, default `pwd` (empty disables auth)
 - `AGY_MODELS`: comma-separated model list
 - `AGY_POLL_INTERVAL`: DB-readiness poll seconds, default `0.25`

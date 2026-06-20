@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sys
 import time
 from typing import Any, AsyncIterator
 
@@ -16,6 +18,23 @@ from config import is_loopback_host, resolve_model, settings
 from fake_stream import make_heartbeat, sse_event, stream_chunks
 from models import ChatCompletionRequest, ModelInfo, ModelList
 
+
+logger = logging.getLogger("agy2api")
+
+
+def _setup_logging() -> None:
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("[agy2api %(asctime)s %(levelname)s] %(message)s", "%H:%M:%S")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+_setup_logging()
 
 app = FastAPI(title="agy2api", version="0.1.0")
 security = HTTPBearer(auto_error=False)
@@ -55,6 +74,10 @@ async def chat_completions(
     prompt = format_messages(request_body.messages)
     model = request_body.model
     agy_model = resolve_model(model)
+    logger.info(
+        "request: model=%s (agy=%s) stream=%s messages=%d prompt_chars=%d",
+        model, agy_model, request_body.stream, len(request_body.messages), len(prompt),
+    )
 
     if request_body.stream:
         return StreamingResponse(
@@ -63,12 +86,22 @@ async def chat_completions(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    started = time.time()
     try:
         result = await _run_agy_guarded(prompt, agy_model)
     except Exception as exc:
+        logger.error(
+            "FAILED (non-stream): model=%s prompt_chars=%d after %.1fs -> %s",
+            model, len(prompt), time.time() - started, exc, exc_info=True,
+        )
         return _error_response(str(exc), status_code=500)
 
     fr = "length" if result.response.truncated else "stop"
+    logger.info(
+        "ok (non-stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s %.1fs",
+        model, len(result.response.answer), len(result.response.reasoning),
+        result.response.truncated, result.db_path.name, time.time() - started,
+    )
     return JSONResponse(
         content=build_completion_response(
             answer=result.response.answer,
@@ -87,10 +120,16 @@ async def health() -> dict[str, str]:
 async def _stream_response(
     prompt: str, model: str, agy_model: str | None, request: Request
 ) -> AsyncIterator[bytes]:
+    started = time.time()
     task = asyncio.create_task(_run_agy_guarded(prompt, agy_model))
     try:
         while not task.done():
             if await request.is_disconnected():
+                logger.warning(
+                    "client disconnected after %.1fs; agy run continues in background "
+                    "until it finishes (cannot be interrupted mid-print)",
+                    time.time() - started,
+                )
                 task.cancel()
                 return
             yield sse_event(make_heartbeat(model))
@@ -98,9 +137,18 @@ async def _stream_response(
 
         result = await task
         fr = "length" if result.response.truncated else "stop"
+        logger.info(
+            "ok (stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s %.1fs",
+            model, len(result.response.answer), len(result.response.reasoning),
+            result.response.truncated, result.db_path.name, time.time() - started,
+        )
         async for item in stream_chunks(result.response.answer, result.response.reasoning, model, finish_reason=fr):
             yield item
     except Exception as exc:
+        logger.error(
+            "FAILED (stream): model=%s prompt_chars=%d after %.1fs -> %s",
+            model, len(prompt), time.time() - started, exc, exc_info=True,
+        )
         yield sse_event({"error": {"message": str(exc), "type": "agy_error"}})
         yield sse_event("[DONE]")
 
