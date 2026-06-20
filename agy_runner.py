@@ -66,6 +66,9 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
     if model:
         command.extend(["--model", model])
 
+    # Windows: suppress the console window that flashes for each agy subprocess.
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
     try:
         try:
             completed = subprocess.run(
@@ -78,6 +81,7 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
                 errors="replace",
                 timeout=settings.request_timeout + 20,
                 check=False,
+                creationflags=creationflags,
             )
         except FileNotFoundError as exc:
             winerror = getattr(exc, "winerror", None)
