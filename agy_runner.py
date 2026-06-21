@@ -46,7 +46,14 @@ def run_agy(
     workdir = Path(settings.workdir)
     if not workdir.exists():
         raise RuntimeError(f"agy working directory does not exist: {workdir}")
-    if not settings.conversations_dir.exists():
+    # In stateful mode agy runs inside an isolated home; make sure it exists so
+    # agy can write its data there. (Auth/login still lives in that home — see
+    # the README; log in there once after enabling stateful mode.) The
+    # conversations subdir is ours to create; the real auth state is not.
+    if settings.stateful:
+        settings.stateful_home.mkdir(parents=True, exist_ok=True)
+        settings.conversations_dir.mkdir(parents=True, exist_ok=True)
+    elif not settings.conversations_dir.exists():
         raise RuntimeError(
             f"agy conversations directory does not exist: {settings.conversations_dir} "
             "(is agy installed and logged in?)"
@@ -95,6 +102,7 @@ def run_agy(
                 errors="replace",
                 timeout=settings.request_timeout + 20,
                 check=False,
+                env=settings.agy_env(),
                 creationflags=creationflags,
             )
         except FileNotFoundError as exc:

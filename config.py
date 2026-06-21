@@ -93,6 +93,13 @@ class Settings:
     # connection timeout on long chats. Opt-in; changes the cleanup lifecycle.
     stateful: bool = _bool_env("AGY2API_STATEFUL", False)
     max_sessions: int = int(os.getenv("AGY2API_MAX_SESSIONS", "200"))
+    # When stateful, run agy inside its OWN home directory so our startup/exit
+    # wipes never touch the user's real ~/.gemini (TUI conversations stay safe).
+    # agy honors USERPROFILE for its home root, so we point it here. Default
+    # ~/.agy2api-home. Set AGY2API_STATEFUL_HOME to override.
+    stateful_home: Path = Path(
+        os.getenv("AGY2API_STATEFUL_HOME", str(Path.home() / ".agy2api-home"))
+    )
     conversations_dir: Path = Path(
         os.getenv(
             "AGY_CONVERSATIONS_DIR",
@@ -110,6 +117,25 @@ class Settings:
             "models",
             _csv_env("AGY_MODELS", list(MODEL_MAP.keys())),
         )
+        # In stateful mode, redirect conversations_dir into the isolated home
+        # so agy reads/writes only there (and our sweeps stay self-contained).
+        if self.stateful:
+            sandbox_conv = self.stateful_home / ".gemini" / "antigravity-cli" / "conversations"
+            object.__setattr__(self, "conversations_dir", sandbox_conv)
+
+    def agy_env(self) -> dict[str, str]:
+        """Environment dict to pass to the agy subprocess.
+
+        In stateful mode, set USERPROFILE to the isolated home so agy's whole
+        data tree (conversations, brain, auth) lives there, fully separated
+        from the user's real ~/.gemini. In stateless mode, pass the current
+        environment unchanged.
+        """
+        if not self.stateful:
+            return os.environ.copy()
+        env = os.environ.copy()
+        env["USERPROFILE"] = str(self.stateful_home)
+        return env
 
 
 settings = Settings()
