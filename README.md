@@ -110,6 +110,12 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - Latency is usually several seconds because each request starts an `agy` run.
 - Antigravity is an agent and may use tools for complex prompts.
 - The protobuf fields are reverse-engineered and may need updates if `agy` changes its cache schema.
+- Long replies can fail mid-generation with `agy upstream error: ... connection
+  forcibly closed` when a proxy/VPN drops the long-lived connection to Google
+  (e.g. a ~60s connection cap). The reasoning phase dominates generation time,
+  so for long chats prefer a low-reasoning model (e.g. `gemini-3.5-flash-low`)
+  to finish sooner, and/or route `*.googleapis.com` through a proxy that allows
+  long-lived connections (or direct).
 
 ## License
 
