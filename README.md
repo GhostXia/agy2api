@@ -100,7 +100,7 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY2API_EXPOSE_REASONING`: emit `reasoning_content`, default `true`
 - `AGY2API_MAX_CONCURRENCY`: max concurrent agy runs, default `3`
 - `AGY2API_CLEANUP_DB`: delete each run's conversation DB + brain dir after reading, default `true`
-- `AGY2API_STATEFUL`: **experimental** — keep a persistent `agy` conversation per chat and send only the new turn each request (instead of resenting the full history every time). Smaller per-turn payloads finish faster and are less likely to trip the upstream ~60s connection cutoff on long chats. Default `false`. See [Stateful mode](#stateful-mode) for the one-time setup and isolation model.
+- `AGY2API_STATEFUL`: **experimental** — keep a persistent `agy` conversation per chat and send only the new turn each request (instead of resenting the full history every time). Smaller per-turn payloads finish faster and are less likely to trip the upstream ~60s connection cutoff on long chats. Default `false`. See [Stateful mode](#stateful-mode) for the isolation model.
 - `AGY2API_MAX_SESSIONS`: cap on live stateful conversations (LRU-evicted above this), default `200`. Only meaningful with `AGY2API_STATEFUL=1`.
 - `AGY2API_STATEFUL_HOME`: isolated `agy` home directory used only in stateful mode, default `~/.agy2api-home`. See [Stateful mode](#stateful-mode).
 - `AGY2API_ALLOW_REMOTE`: allow binding a non-loopback host, default `false`
@@ -131,19 +131,14 @@ TUI are in a different directory and are not affected.
 The startup/exit disk wipes (below) therefore only ever delete agy2api's own
 sandbox files.
 
-### One-time login
+### Login (no separate login needed)
 
-Because the sandbox home is separate, `agy` is **not logged in there** until
-you do it once. After enabling `AGY2API_STATEFUL=1`, run this once:
-
-```powershell
-$env:USERPROFILE = "$env:USERPROFILE\.agy2api-home"
-agy
-# complete the login flow, then exit
-```
-
-(Substitute your `AGY2API_STATEFUL_HOME` if you changed it.) The login persists
-in the sandbox; you won't need to repeat it.
+`agy` stores its OAuth token in the **OS credential store** (Windows Credential
+Manager), not in the home directory. That store is system-scoped, so the
+sandbox automatically inherits your existing `agy` login — **no separate login
+is required**. As long as `agy` works for you normally (you've logged in via
+the TUI at least once), it works in the sandbox too. `start.bat` checks for
+this credential before launching.
 
 ### Disk cleanup (bounded by design)
 
