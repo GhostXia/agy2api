@@ -101,15 +101,27 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
         # (status=2) that conversation_reader can degrade-read into usable text.
         # Skipping the DB on non-zero exit was the original blank-response bug.
         db_path = _db_from_log(log_path)
+        # owned_by_us: the DB was positively identified via THIS run's --log-file
+        # conversation id, so it is definitely the conversation this invocation
+        # created. The fallback below is a heuristic ("newest DB") that could in
+        # theory point at a conversation the user started manually at the same
+        # moment — so we never auto-delete in that case.
+        owned_by_us = db_path is not None
         if db_path is None:
             # Fallback: log gave no conversation id (older agy?) — pick newest new DB.
             db_path = _find_new_conversation_db(settings.conversations_dir, before, start_time)
 
         if db_path is not None:
             response = _read_response_with_retry(db_path)
-            # On clean exit + cleanup enabled, discard local artifacts.
-            # On abnormal exit, keep DB for debugging even if cleanup is on.
-            if settings.cleanup_db and completed.returncode == 0 and not response.truncated:
+            # Only delete artifacts we positively own (resolved via our log id),
+            # on a clean, non-truncated run. Never delete a heuristically-matched
+            # DB — it might be the user's own manual agy conversation.
+            if (
+                settings.cleanup_db
+                and owned_by_us
+                and completed.returncode == 0
+                and not response.truncated
+            ):
                 _cleanup_conversation(db_path)
             return AgyRunResult(
                 db_path=db_path,
