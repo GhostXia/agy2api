@@ -13,10 +13,13 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from agy_runner import run_agy_async, sweep_orphan_sidecars
+from pathlib import Path
+
+from agy_runner import cleanup_conversation, run_agy_async, sweep_orphan_sidecars
 from config import is_loopback_host, resolve_model, settings
 from fake_stream import make_heartbeat, sse_event, stream_chunks
 from models import ChatCompletionRequest, ModelInfo, ModelList
+from session_store import SessionStore, fingerprint
 
 
 logger = logging.getLogger("agy2api")
@@ -43,10 +46,71 @@ security = HTTPBearer(auto_error=False)
 # concurrent conversation-DB race. See config.max_concurrency.
 _run_semaphore = asyncio.Semaphore(max(1, settings.max_concurrency))
 
+# Experimental stateful-session layer (AGY2API_STATEFUL).
+_session_store = SessionStore(settings.max_sessions) if settings.stateful else None
+_conv_locks: dict[str, asyncio.Lock] = {}
 
-async def _run_agy_guarded(prompt: str, model: str | None):
+
+def _conv_lock(conversation_id: str) -> asyncio.Lock:
+    lock = _conv_locks.get(conversation_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _conv_locks[conversation_id] = lock
+    return lock
+
+
+async def _run_agy_guarded(
+    prompt: str, model: str | None, conversation_id: str | None = None, keep: bool = False
+):
     async with _run_semaphore:
-        return await run_agy_async(prompt, model)
+        return await run_agy_async(prompt, model, conversation_id, keep)
+
+
+async def _execute_run(prompt: str, model: str | None, resume_id: str | None, keep: bool):
+    """Run agy, serializing turns of the same resumed conversation so concurrent
+    requests for one chat don't corrupt its session."""
+    if resume_id:
+        async with _conv_lock(resume_id):
+            return await _run_agy_guarded(prompt, model, resume_id, keep)
+    return await _run_agy_guarded(prompt, model, None, keep)
+
+
+def _msg_sigs(messages: list[Any]) -> list[str]:
+    return [
+        fingerprint(getattr(m, "role", "user"), _content_to_text(getattr(m, "content", "")))
+        for m in messages
+    ]
+
+
+def _plan_request(messages: list[Any]) -> tuple[str, str | None, list[str]]:
+    """Return (prompt_to_send, resume_conversation_id, sigs).
+
+    In stateful mode, if this request continues a known chat, send only the new
+    turn against the existing agy conversation. Otherwise send the full history.
+    """
+    if _session_store is None:
+        return format_messages(messages), None, []
+    sigs = _msg_sigs(messages)
+    plan = _session_store.lookup(sigs)
+    if plan.conversation_id and plan.prefix_len < len(messages):
+        new = messages[plan.prefix_len:]
+        # Drop leading assistant turns — those are agy's own prior replies that
+        # the client echoes back; agy already has them in memory.
+        while new and getattr(new[0], "role", "") == "assistant":
+            new = new[1:]
+        if new:
+            return format_messages(new), plan.conversation_id, sigs
+    return format_messages(messages), None, sigs
+
+
+def _record_session(conversation_id: str, sigs: list[str]) -> None:
+    if _session_store is None or not conversation_id:
+        return
+    for evicted in _session_store.remember(conversation_id, sigs):
+        try:
+            cleanup_conversation(evicted)
+        except Exception as exc:  # housekeeping must not break the request
+            logger.warning("evicted-session cleanup failed for %s: %s", evicted, exc)
 
 
 async def verify_token(
@@ -71,24 +135,26 @@ async def chat_completions(
     request: Request,
     _: None = Depends(verify_token),
 ):
-    prompt = format_messages(request_body.messages)
     model = request_body.model
     agy_model = resolve_model(model)
+    prompt, resume_id, sigs = _plan_request(request_body.messages)
+    keep = settings.stateful
     logger.info(
-        "request: model=%s (agy=%s) stream=%s messages=%d prompt_chars=%d",
-        model, agy_model, request_body.stream, len(request_body.messages), len(prompt),
+        "request: model=%s (agy=%s) stream=%s messages=%d prompt_chars=%d resume=%s",
+        model, agy_model, request_body.stream, len(request_body.messages),
+        len(prompt), bool(resume_id),
     )
 
     if request_body.stream:
         return StreamingResponse(
-            _stream_response(prompt, model, agy_model, request),
+            _stream_response(prompt, model, agy_model, request, resume_id, keep, sigs),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     started = time.time()
     try:
-        result = await _run_agy_guarded(prompt, agy_model)
+        result = await _execute_run(prompt, agy_model, resume_id, keep)
     except Exception as exc:
         logger.error(
             "FAILED (non-stream): model=%s prompt_chars=%d after %.1fs -> %s",
@@ -96,11 +162,12 @@ async def chat_completions(
         )
         return _error_response(str(exc), status_code=500)
 
+    _record_session(Path(result.db_path).stem, sigs)
     fr = "length" if result.response.truncated else "stop"
     logger.info(
-        "ok (non-stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s %.1fs",
+        "ok (non-stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s resume=%s %.1fs",
         model, len(result.response.answer), len(result.response.reasoning),
-        result.response.truncated, result.db_path.name, time.time() - started,
+        result.response.truncated, result.db_path.name, bool(resume_id), time.time() - started,
     )
     return JSONResponse(
         content=build_completion_response(
@@ -128,10 +195,11 @@ async def health() -> dict[str, str]:
 
 
 async def _stream_response(
-    prompt: str, model: str, agy_model: str | None, request: Request
+    prompt: str, model: str, agy_model: str | None, request: Request,
+    resume_id: str | None = None, keep: bool = False, sigs: list[str] | None = None,
 ) -> AsyncIterator[bytes]:
     started = time.time()
-    task = asyncio.create_task(_run_agy_guarded(prompt, agy_model))
+    task = asyncio.create_task(_execute_run(prompt, agy_model, resume_id, keep))
     try:
         while not task.done():
             if await request.is_disconnected():
@@ -146,11 +214,13 @@ async def _stream_response(
             await asyncio.sleep(1)
 
         result = await task
+        if sigs:
+            _record_session(Path(result.db_path).stem, sigs)
         fr = "length" if result.response.truncated else "stop"
         logger.info(
-            "ok (stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s %.1fs",
+            "ok (stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s resume=%s %.1fs",
             model, len(result.response.answer), len(result.response.reasoning),
-            result.response.truncated, result.db_path.name, time.time() - started,
+            result.response.truncated, result.db_path.name, bool(resume_id), time.time() - started,
         )
         async for item in stream_chunks(result.response.answer, result.response.reasoning, model, finish_reason=fr):
             yield item

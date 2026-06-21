@@ -23,7 +23,19 @@ class AgyRunResult:
     stderr: str = ""
 
 
-def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
+def run_agy(
+    prompt: str,
+    model: str | None = None,
+    conversation_id: str | None = None,
+    keep: bool = False,
+) -> AgyRunResult:
+    """Run agy once.
+
+    conversation_id: resume an existing agy conversation (stateful sessions) so
+      only the new turn needs to be sent instead of the full history.
+    keep: never delete the conversation DB afterwards (a stateful session owns
+      its lifecycle and needs the memory for later turns).
+    """
     start_time = time.time()
 
     # Validate prerequisites up front so failures name the real culprit instead
@@ -63,6 +75,8 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
         "--log-file", log_path,
         "--print-timeout", f"{int(settings.request_timeout)}s",
     ]
+    if conversation_id:
+        command.extend(["--conversation", conversation_id])
     if model:
         command.extend(["--model", model])
 
@@ -118,6 +132,7 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
             # DB — it might be the user's own manual agy conversation.
             if (
                 settings.cleanup_db
+                and not keep
                 and owned_by_us
                 and completed.returncode == 0
                 and not response.truncated
@@ -182,6 +197,12 @@ def _cleanup_conversation(db_path: Path) -> None:
         shutil.rmtree(brain_dir, ignore_errors=True)
 
 
+def cleanup_conversation(conversation_id: str) -> None:
+    """Public: delete a conversation's DB + sidecars + brain dir by id. Used to
+    drop evicted stateful sessions."""
+    _cleanup_conversation(settings.conversations_dir / f"{conversation_id}.db")
+
+
 def sweep_orphan_sidecars() -> int:
     """Delete SQLite sidecar files whose parent .db no longer exists. These are
     pure garbage left behind (e.g. by older cleanup that only removed the .db).
@@ -238,8 +259,13 @@ def _read_response_with_retry(db_path: Path) -> AgResponse:
             time.sleep(0.2)
 
 
-async def run_agy_async(prompt: str, model: str | None = None) -> AgyRunResult:
-    return await asyncio.to_thread(run_agy, prompt, model)
+async def run_agy_async(
+    prompt: str,
+    model: str | None = None,
+    conversation_id: str | None = None,
+    keep: bool = False,
+) -> AgyRunResult:
+    return await asyncio.to_thread(run_agy, prompt, model, conversation_id, keep)
 
 
 def _snapshot_conversations(directory: Path) -> dict[Path, float]:

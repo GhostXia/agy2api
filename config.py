@@ -87,6 +87,12 @@ class Settings:
     # successful read to keep local session files from piling up. Set false to
     # retain them for debugging. (Does NOT reduce server-side conversation count.)
     cleanup_db: bool = _bool_env("AGY2API_CLEANUP_DB", True)
+    # Experimental: keep a persistent agy conversation per chat and send only the
+    # new turn each request (instead of resending the full history). Smaller
+    # per-turn payloads finish faster and are less likely to hit an upstream
+    # connection timeout on long chats. Opt-in; changes the cleanup lifecycle.
+    stateful: bool = _bool_env("AGY2API_STATEFUL", False)
+    max_sessions: int = int(os.getenv("AGY2API_MAX_SESSIONS", "200"))
     conversations_dir: Path = Path(
         os.getenv(
             "AGY_CONVERSATIONS_DIR",
