@@ -70,16 +70,25 @@ Make sure `agy` is installed and already logged in (see Prerequisites).
 
 ## Run
 
+**Windows (recommended): `start.bat`** — a one-click launcher that checks `agy`
+login, sets up the venv, then asks which mode to run:
+
+| Choice | Mode | Best for |
+| --- | --- | --- |
+| `1` (default — just press Enter) | **Stateful** | ongoing chats / roleplay; only the new turn is sent each request, so long chats are much less likely to hit the upstream cutoff |
+| `2` | **Stateless** | simple / one-off requests; full history resent each time |
+
+Set `AGY2API_STATEFUL` in the environment beforehand (`1`/`0`) to skip the
+prompt. See [Stateful mode](#stateful-mode) for what stateful changes.
+
+**Manual / non-Windows:**
+
 ```powershell
 $env:AGY2API_KEY="pwd"
-python server.py
+python server.py          # stateless by default; set AGY2API_STATEFUL=1 for stateful
 ```
 
 Default URL: `http://127.0.0.1:7862`.
-
-On Windows, `start.bat` is a one-click launcher: it checks `agy` login, sets up
-the venv, then prompts for **Stateful (default)** vs **Stateless** mode. Set
-`AGY2API_STATEFUL` in the environment beforehand to skip the prompt.
 
 ## Request
 
@@ -116,7 +125,8 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 `AGY2API_STATEFUL=1` keeps one persistent `agy` conversation per chat and
 forwards only the new turn each request, instead of re-sending the full
 history. This shrinks per-turn payloads and makes long chats far less likely
-to hit the upstream connection cutoff.
+to hit the upstream connection cutoff. (`start.bat` selects this mode by
+default.)
 
 Because the OpenAI protocol is stateless, this is mapped heuristically: the
 incoming message list is fingerprinted, and if its prefix matches a chat we've
