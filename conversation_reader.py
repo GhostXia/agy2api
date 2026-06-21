@@ -27,6 +27,13 @@ _ERROR_KEYWORDS = (
 )
 
 
+class AgyUpstreamError(ValueError):
+    """Raised when agy logged a transient upstream/transport failure (e.g. the
+    connection to Google was reset mid-stream). Subclasses ValueError so callers
+    that already catch ValueError keep working; the runner catches this
+    specifically to retry the whole run."""
+
+
 @dataclass(frozen=True)
 class AgResponse:
     answer: str
@@ -74,7 +81,7 @@ def read_response(db_path: str | Path) -> AgResponse:
     # a parsing problem.
     error = _extract_error(rows)
     if error:
-        raise ValueError(f"agy upstream error: {error}")
+        raise AgyUpstreamError(f"agy upstream error: {error}")
 
     # Degraded read: agy killed mid-generation may leave a partial (non-DONE)
     # row whose text is still better than a blank response.

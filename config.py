@@ -87,6 +87,11 @@ class Settings:
     # successful read to keep local session files from piling up. Set false to
     # retain them for debugging. (Does NOT reduce server-side conversation count.)
     cleanup_db: bool = _bool_env("AGY2API_CLEANUP_DB", True)
+    # Retry the whole agy run on transient upstream errors (e.g. the connection
+    # to Google reset mid-stream). Each retry is a fresh, full run. Best-effort
+    # band-aid for flaky networks/proxies — won't help a hard, consistent cutoff.
+    max_retries: int = int(os.getenv("AGY2API_MAX_RETRIES", "1"))
+    retry_backoff: float = float(os.getenv("AGY2API_RETRY_BACKOFF", "1.5"))
     conversations_dir: Path = Path(
         os.getenv(
             "AGY_CONVERSATIONS_DIR",

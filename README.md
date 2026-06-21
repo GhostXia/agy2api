@@ -100,6 +100,8 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY2API_EXPOSE_REASONING`: emit `reasoning_content`, default `true`
 - `AGY2API_MAX_CONCURRENCY`: max concurrent agy runs, default `3`
 - `AGY2API_CLEANUP_DB`: delete each run's conversation DB + brain dir after reading, default `true`
+- `AGY2API_MAX_RETRIES`: extra retries on transient upstream errors, default `1`
+- `AGY2API_RETRY_BACKOFF`: base seconds between retries (×attempt), default `1.5`
 - `AGY2API_ALLOW_REMOTE`: allow binding a non-loopback host, default `false`
 - `HOST`: bind address, default `127.0.0.1` (see Auth & Privacy / Compliance)
 - `PORT`: server port, default `7862`

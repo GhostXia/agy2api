@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -13,7 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from config import settings
-from conversation_reader import AgResponse, read_response
+from conversation_reader import AgResponse, AgyUpstreamError, read_response
+
+logger = logging.getLogger("agy2api")
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,25 @@ class AgyRunResult:
 
 
 def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
+    """Run agy, retrying the whole run on transient upstream errors."""
+    attempts = max(1, settings.max_retries + 1)
+    for attempt in range(attempts):
+        try:
+            return _run_agy_once(prompt, model)
+        except AgyUpstreamError as exc:
+            if attempt >= attempts - 1:
+                raise
+            delay = settings.retry_backoff * (attempt + 1)
+            logger.warning(
+                "upstream error (attempt %d/%d), retrying in %.1fs: %s",
+                attempt + 1, attempts, delay, exc,
+            )
+            time.sleep(delay)
+    # Unreachable, but keeps type checkers happy.
+    raise RuntimeError("run_agy exhausted retries without returning")
+
+
+def _run_agy_once(prompt: str, model: str | None = None) -> AgyRunResult:
     start_time = time.time()
 
     # Validate prerequisites up front so failures name the real culprit instead
@@ -232,6 +254,10 @@ def _read_response_with_retry(db_path: Path) -> AgResponse:
     while True:
         try:
             return read_response(db_path)
+        except AgyUpstreamError:
+            # A logged upstream error is final for this DB — don't re-read it;
+            # let run_agy decide whether to retry the whole run.
+            raise
         except ValueError:
             if time.time() >= deadline:
                 raise
