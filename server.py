@@ -8,6 +8,7 @@ import json
 import logging
 import sys
 import time
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -45,7 +46,45 @@ def _setup_logging() -> None:
 
 _setup_logging()
 
-app = FastAPI(title="agy2api", version="1.1.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """App lifespan: run housekeeping sweeps on startup, and again on shutdown.
+
+    The shutdown sweep is wrapped in `finally` so it still runs if the served
+    application raises during its lifetime. (The `atexit` hook is a further
+    last-resort guarantee for the stateful wipe.)"""
+    # Startup housekeeping.
+    try:
+        if settings.stateful:
+            # Hard reset: the in-memory session store starts empty, so any .db
+            # files kept alive by a previous run are unreachable orphans. Wipe
+            # them now (stateful memory does not survive a restart anyway).
+            removed = sweep_all_conversations()
+            logger.info("startup (stateful): wiped %d conversation db(s)", removed)
+        else:
+            removed = sweep_orphan_sidecars()
+            if removed:
+                logger.info("startup: swept %d orphan SQLite sidecar file(s)", removed)
+    except Exception as exc:  # never block startup on housekeeping
+        logger.warning("startup sweep failed: %s", exc)
+
+    try:
+        yield
+    finally:
+        # Shutdown housekeeping. The atexit hook covers plain `python server.py`
+        # exit too; this fires on uvicorn's graceful stop. Belt-and-suspenders so
+        # a clean stop never leaves orphaned stateful sessions behind.
+        if settings.stateful:
+            try:
+                removed = sweep_all_conversations()
+                if removed:
+                    logger.info("shutdown (stateful): wiped %d conversation db(s)", removed)
+            except Exception as exc:  # never block shutdown on housekeeping
+                logger.warning("shutdown sweep failed: %s", exc)
+
+
+app = FastAPI(title="agy2api", version="1.1.0", lifespan=_lifespan)
 security = HTTPBearer(auto_error=False)
 
 # Limit concurrent agy runs (default 1) to mimic human-paced usage and avoid the
@@ -224,37 +263,6 @@ async def chat_completions(
             finish_reason=fr,
         )
     )
-
-
-@app.on_event("startup")
-async def _startup_sweep() -> None:
-    try:
-        if settings.stateful:
-            # Hard reset: the in-memory session store starts empty, so any .db
-            # files kept alive by a previous run are unreachable orphans. Wipe
-            # them now (stateful memory does not survive a restart anyway).
-            removed = sweep_all_conversations()
-            logger.info("startup (stateful): wiped %d conversation db(s)", removed)
-        else:
-            removed = sweep_orphan_sidecars()
-            if removed:
-                logger.info("startup: swept %d orphan SQLite sidecar file(s)", removed)
-    except Exception as exc:  # never block startup on housekeeping
-        logger.warning("startup sweep failed: %s", exc)
-
-
-@app.on_event("shutdown")
-async def _shutdown_sweep() -> None:
-    # The atexit hook (below) covers normal `python server.py` exit too; this
-    # fires on uvicorn's graceful shutdown signal. Belt-and-suspenders so a
-    # clean stop never leaves orphaned stateful sessions behind.
-    if settings.stateful:
-        try:
-            removed = sweep_all_conversations()
-            if removed:
-                logger.info("shutdown (stateful): wiped %d conversation db(s)", removed)
-        except Exception as exc:  # never block shutdown on housekeeping
-            logger.warning("shutdown sweep failed: %s", exc)
 
 
 @app.get("/health")
