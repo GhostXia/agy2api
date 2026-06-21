@@ -48,7 +48,12 @@ _setup_logging()
 
 
 @asynccontextmanager
-async def _lifespan(_app: FastAPI):
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """App lifespan: run housekeeping sweeps on startup, and again on shutdown.
+
+    The shutdown sweep is wrapped in `finally` so it still runs if the served
+    application raises during its lifetime. (The `atexit` hook is a further
+    last-resort guarantee for the stateful wipe.)"""
     # Startup housekeeping.
     try:
         if settings.stateful:
@@ -64,18 +69,19 @@ async def _lifespan(_app: FastAPI):
     except Exception as exc:  # never block startup on housekeeping
         logger.warning("startup sweep failed: %s", exc)
 
-    yield
-
-    # Shutdown housekeeping. The atexit hook covers plain `python server.py`
-    # exit too; this fires on uvicorn's graceful stop. Belt-and-suspenders so a
-    # clean stop never leaves orphaned stateful sessions behind.
-    if settings.stateful:
-        try:
-            removed = sweep_all_conversations()
-            if removed:
-                logger.info("shutdown (stateful): wiped %d conversation db(s)", removed)
-        except Exception as exc:  # never block shutdown on housekeeping
-            logger.warning("shutdown sweep failed: %s", exc)
+    try:
+        yield
+    finally:
+        # Shutdown housekeeping. The atexit hook covers plain `python server.py`
+        # exit too; this fires on uvicorn's graceful stop. Belt-and-suspenders so
+        # a clean stop never leaves orphaned stateful sessions behind.
+        if settings.stateful:
+            try:
+                removed = sweep_all_conversations()
+                if removed:
+                    logger.info("shutdown (stateful): wiped %d conversation db(s)", removed)
+            except Exception as exc:  # never block shutdown on housekeeping
+                logger.warning("shutdown sweep failed: %s", exc)
 
 
 app = FastAPI(title="agy2api", version="1.1.0", lifespan=_lifespan)
