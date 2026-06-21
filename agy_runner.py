@@ -251,7 +251,8 @@ def sweep_all_conversations() -> int:
     removed = 0
     for db_path in directory.glob("*.db"):
         _cleanup_conversation(db_path)
-        removed += 1
+        if not db_path.exists():  # count only DBs actually deleted
+            removed += 1
     # brain/<id>/ dirs whose .db we may already have removed (or never existed).
     brain_dir = directory.parent / "brain"
     if brain_dir.is_dir():

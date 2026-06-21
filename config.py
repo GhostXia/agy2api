@@ -95,10 +95,14 @@ class Settings:
     max_sessions: int = int(os.getenv("AGY2API_MAX_SESSIONS", "200"))
     # When stateful, run agy inside its OWN home directory so our startup/exit
     # wipes never touch the user's real ~/.gemini (TUI conversations stay safe).
-    # agy honors USERPROFILE for its home root, so we point it here. Default
-    # ~/.agy2api-home. Set AGY2API_STATEFUL_HOME to override.
+    # agy honors USERPROFILE for its home root, so we point it here. Default is a
+    # `stateful_home/` folder INSIDE this project (gitignored), so it's easy to
+    # find and manage. Set AGY2API_STATEFUL_HOME to override.
     stateful_home: Path = Path(
-        os.getenv("AGY2API_STATEFUL_HOME", str(Path.home() / ".agy2api-home"))
+        os.getenv(
+            "AGY2API_STATEFUL_HOME",
+            str(Path(__file__).resolve().parent / "stateful_home"),
+        )
     )
     conversations_dir: Path = Path(
         os.getenv(

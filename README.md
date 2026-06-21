@@ -102,7 +102,7 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY2API_CLEANUP_DB`: delete each run's conversation DB + brain dir after reading, default `true`
 - `AGY2API_STATEFUL`: **experimental** — keep a persistent `agy` conversation per chat and send only the new turn each request (instead of resenting the full history every time). Smaller per-turn payloads finish faster and are less likely to trip the upstream ~60s connection cutoff on long chats. Default `false`. See [Stateful mode](#stateful-mode) for the isolation model.
 - `AGY2API_MAX_SESSIONS`: cap on live stateful conversations (LRU-evicted above this), default `200`. Only meaningful with `AGY2API_STATEFUL=1`.
-- `AGY2API_STATEFUL_HOME`: isolated `agy` home directory used only in stateful mode, default `~/.agy2api-home`. See [Stateful mode](#stateful-mode).
+- `AGY2API_STATEFUL_HOME`: isolated `agy` home directory used only in stateful mode, default `stateful_home/` inside the project (gitignored). See [Stateful mode](#stateful-mode).
 - `AGY2API_ALLOW_REMOTE`: allow binding a non-loopback host, default `false`
 - `HOST`: bind address, default `127.0.0.1` (see Auth & Privacy / Compliance)
 - `PORT`: server port, default `7862`
@@ -122,11 +122,12 @@ conversation via `agy --conversation <id>`.
 ### Isolated home (your TUI conversations stay safe)
 
 Stateful mode runs `agy` inside its **own** home directory (default
-`~/.agy2api-home`, override with `AGY2API_STATEFUL_HOME`). It does this by
-setting `USERPROFILE` to that path for every `agy` subprocess, so `agy`'s
-entire data tree — conversations, brain, cache — lives there and **never
-touches your real `~/.gemini`**. Conversations you open manually in the `agy`
-TUI are in a different directory and are not affected.
+`stateful_home/` inside this project, gitignored; override with
+`AGY2API_STATEFUL_HOME`). It does this by setting `USERPROFILE` to that path for
+every `agy` subprocess, so `agy`'s entire data tree — conversations, brain,
+cache — lives there and **never touches your real `~/.gemini`**. Conversations
+you open manually in the `agy` TUI are in a different directory and are not
+affected.
 
 The startup/exit disk wipes (below) therefore only ever delete agy2api's own
 sandbox files.

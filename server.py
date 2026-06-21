@@ -55,6 +55,8 @@ _run_semaphore = asyncio.Semaphore(max(1, settings.max_concurrency))
 # Experimental stateful-session layer (AGY2API_STATEFUL).
 _session_store = SessionStore(settings.max_sessions) if settings.stateful else None
 _conv_locks: dict[str, asyncio.Lock] = {}
+# Conversations currently being run (resumed). Eviction must not delete these.
+_in_flight: set[str] = set()
 
 
 def _stateful_wipe() -> None:
@@ -93,10 +95,19 @@ async def _run_agy_guarded(
 
 async def _execute_run(prompt: str, model: str | None, resume_id: str | None, keep: bool):
     """Run agy, serializing turns of the same resumed conversation so concurrent
-    requests for one chat don't corrupt its session."""
+    requests for one chat don't corrupt its session.
+
+    Note: planning (_plan_request) happens before this lock, so two *concurrent*
+    turns of the SAME chat could plan against stale state. OpenAI clients
+    (SillyTavern) serialize turns per chat — they wait for each reply — so this
+    is not hit in practice; concurrent turns of one chat are unsupported."""
     if resume_id:
         async with _conv_lock(resume_id):
-            return await _run_agy_guarded(prompt, model, resume_id, keep)
+            _in_flight.add(resume_id)
+            try:
+                return await _run_agy_guarded(prompt, model, resume_id, keep)
+            finally:
+                _in_flight.discard(resume_id)
     return await _run_agy_guarded(prompt, model, None, keep)
 
 
@@ -131,11 +142,21 @@ def _plan_request(messages: list[Any]) -> tuple[str, str | None, list[str]]:
 def _record_session(conversation_id: str, sigs: list[str]) -> None:
     if _session_store is None or not conversation_id:
         return
-    for evicted in _session_store.remember(conversation_id, sigs):
+    for evicted in _session_store.remember(conversation_id, sigs, protected=_in_flight):
+        _conv_locks.pop(evicted, None)  # drop the lock too (no unbounded growth)
         try:
             cleanup_conversation(evicted)
         except Exception as exc:  # housekeeping must not break the request
             logger.warning("evicted-session cleanup failed for %s: %s", evicted, exc)
+
+
+def _forget_session(resume_id: str | None) -> None:
+    """On a failed resumed turn, drop the session so the NEXT turn rebuilds from
+    full history instead of resuming a conversation that's now wedged. Without
+    this, a broken session keeps failing until the server restarts."""
+    if _session_store is not None and resume_id:
+        _session_store.forget(resume_id)
+        _conv_locks.pop(resume_id, None)
 
 
 async def verify_token(
@@ -181,6 +202,7 @@ async def chat_completions(
     try:
         result = await _execute_run(prompt, agy_model, resume_id, keep)
     except Exception as exc:
+        _forget_session(resume_id)
         logger.error(
             "FAILED (non-stream): model=%s prompt_chars=%d after %.1fs -> %s",
             model, len(prompt), time.time() - started, exc, exc_info=True,
@@ -271,6 +293,7 @@ async def _stream_response(
         async for item in stream_chunks(result.response.answer, result.response.reasoning, model, finish_reason=fr):
             yield item
     except Exception as exc:
+        _forget_session(resume_id)
         logger.error(
             "FAILED (stream): model=%s prompt_chars=%d after %.1fs -> %s",
             model, len(prompt), time.time() - started, exc, exc_info=True,

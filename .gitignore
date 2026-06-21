@@ -15,6 +15,9 @@ srv.err
 # Local conversation databases (never commit — contain prompts/responses)
 *.db
 
+# Stateful-mode isolated agy home (contains OAuth/auth state + conversations)
+stateful_home/
+
 # OS / editor
 .DS_Store
 .idea/
