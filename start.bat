@@ -67,6 +67,25 @@ if errorlevel 1 (
     )
 )
 
+:: Choose mode (default: stateful). Skipped if AGY2API_STATEFUL is already set
+:: in the environment, so callers can force a mode non-interactively.
+if not defined AGY2API_STATEFUL (
+    echo.
+    echo Select mode:
+    echo   [1] Stateful   - persistent per-chat memory, sends only the new turn.
+    echo                    Best for long chats / avoiding the upstream cutoff. ^(default^)
+    echo   [2] Stateless  - classic; resends full history each turn.
+    set "MODE_CHOICE="
+    set /p "MODE_CHOICE=Enter choice [1]: "
+    if "!MODE_CHOICE!"=="2" (
+        set "AGY2API_STATEFUL=0"
+        echo [INFO] Stateless mode selected.
+    ) else (
+        set "AGY2API_STATEFUL=1"
+        echo [INFO] Stateful mode selected.
+    )
+)
+
 :: Set default API key if not already configured
 if not defined AGY2API_KEY (
     set "AGY2API_KEY=pwd"
@@ -75,8 +94,11 @@ if not defined AGY2API_KEY (
 
 :: Start server
 echo.
+set "MODE_LABEL=stateless"
+if "!AGY2API_STATEFUL!"=="1" set "MODE_LABEL=stateful"
 echo ========================================
 echo   agy2api is starting...
+echo   Mode:    !MODE_LABEL!
 echo   API Key: !AGY2API_KEY!
 echo   Press Ctrl+C to stop.
 echo ========================================

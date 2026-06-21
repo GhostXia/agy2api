@@ -77,6 +77,10 @@ python server.py
 
 Default URL: `http://127.0.0.1:7862`.
 
+On Windows, `start.bat` is a one-click launcher: it checks `agy` login, sets up
+the venv, then prompts for **Stateful (default)** vs **Stateless** mode. Set
+`AGY2API_STATEFUL` in the environment beforehand to skip the prompt.
+
 ## Request
 
 ```bash
