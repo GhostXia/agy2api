@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from agy_runner import run_agy_async
+from agy_runner import run_agy_async, sweep_orphan_sidecars
 from config import is_loopback_host, resolve_model, settings
 from fake_stream import make_heartbeat, sse_event, stream_chunks
 from models import ChatCompletionRequest, ModelInfo, ModelList
@@ -110,6 +110,16 @@ async def chat_completions(
             finish_reason=fr,
         )
     )
+
+
+@app.on_event("startup")
+async def _startup_sweep() -> None:
+    try:
+        removed = sweep_orphan_sidecars()
+        if removed:
+            logger.info("startup: swept %d orphan SQLite sidecar file(s)", removed)
+    except Exception as exc:  # never block startup on housekeeping
+        logger.warning("startup sweep failed: %s", exc)
 
 
 @app.get("/health")

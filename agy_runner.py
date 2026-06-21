@@ -138,9 +138,13 @@ _CONVERSATION_ID_RE = re.compile(
 )
 
 
+# SQLite (WAL mode) keeps these sidecar files next to each <id>.db.
+_DB_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
 def _cleanup_conversation(db_path: Path) -> None:
-    """Remove a finished run's local artifacts: the conversation DB and its
-    sibling brain/<id>/ directory. Best-effort; never raises.
+    """Remove a finished run's local artifacts: the conversation DB, its SQLite
+    WAL/SHM sidecars, and the sibling brain/<id>/ directory. Best-effort.
 
     The DB stays briefly locked right after agy exits (Windows handle/flush
     lag), so retry the unlink for a short window before giving up."""
@@ -155,9 +159,35 @@ def _cleanup_conversation(db_path: Path) -> None:
             if time.time() >= deadline:
                 break
             time.sleep(0.2)
+    for suffix in _DB_SIDECAR_SUFFIXES:
+        sidecar = db_path.with_name(db_path.name + suffix)
+        try:
+            sidecar.unlink()
+        except OSError:
+            pass
     brain_dir = db_path.parent.parent / "brain" / db_path.stem
     if brain_dir.is_dir():
         shutil.rmtree(brain_dir, ignore_errors=True)
+
+
+def sweep_orphan_sidecars() -> int:
+    """Delete SQLite sidecar files whose parent .db no longer exists. These are
+    pure garbage left behind (e.g. by older cleanup that only removed the .db).
+    Returns the number of files removed."""
+    directory = settings.conversations_dir
+    if not directory.exists():
+        return 0
+    removed = 0
+    for suffix in _DB_SIDECAR_SUFFIXES:
+        for sidecar in directory.glob(f"*.db{suffix}"):
+            base = sidecar.with_name(sidecar.name[: -len(suffix)])
+            if not base.exists():
+                try:
+                    sidecar.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
 
 
 def _db_from_log(log_path: str) -> Path | None:
