@@ -100,9 +100,62 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY2API_EXPOSE_REASONING`: emit `reasoning_content`, default `true`
 - `AGY2API_MAX_CONCURRENCY`: max concurrent agy runs, default `3`
 - `AGY2API_CLEANUP_DB`: delete each run's conversation DB + brain dir after reading, default `true`
+- `AGY2API_STATEFUL`: **experimental** — keep a persistent `agy` conversation per chat and send only the new turn each request (instead of resenting the full history every time). Smaller per-turn payloads finish faster and are less likely to trip the upstream ~60s connection cutoff on long chats. Default `false`. See [Stateful mode](#stateful-mode) for the isolation model.
+- `AGY2API_MAX_SESSIONS`: cap on live stateful conversations (LRU-evicted above this), default `200`. Only meaningful with `AGY2API_STATEFUL=1`.
+- `AGY2API_STATEFUL_HOME`: isolated `agy` home directory used only in stateful mode, default `stateful_home/` inside the project (gitignored). See [Stateful mode](#stateful-mode).
 - `AGY2API_ALLOW_REMOTE`: allow binding a non-loopback host, default `false`
 - `HOST`: bind address, default `127.0.0.1` (see Auth & Privacy / Compliance)
 - `PORT`: server port, default `7862`
+
+## Stateful mode
+
+`AGY2API_STATEFUL=1` keeps one persistent `agy` conversation per chat and
+forwards only the new turn each request, instead of re-sending the full
+history. This shrinks per-turn payloads and makes long chats far less likely
+to hit the upstream connection cutoff.
+
+Because the OpenAI protocol is stateless, this is mapped heuristically: the
+incoming message list is fingerprinted, and if its prefix matches a chat we've
+already forwarded, only the trailing new turn is sent to the existing
+conversation via `agy --conversation <id>`.
+
+### Isolated home (your TUI conversations stay safe)
+
+Stateful mode runs `agy` inside its **own** home directory (default
+`stateful_home/` inside this project, gitignored; override with
+`AGY2API_STATEFUL_HOME`). It does this by setting `USERPROFILE` to that path for
+every `agy` subprocess, so `agy`'s entire data tree — conversations, brain,
+cache — lives there and **never touches your real `~/.gemini`**. Conversations
+you open manually in the `agy` TUI are in a different directory and are not
+affected.
+
+The startup/exit disk wipes (below) therefore only ever delete agy2api's own
+sandbox files.
+
+### Login (no separate login needed)
+
+`agy` stores its OAuth token in the **OS credential store** (Windows Credential
+Manager), not in the home directory. That store is system-scoped, so the
+sandbox automatically inherits your existing `agy` login — **no separate login
+is required**. As long as `agy` works for you normally (you've logged in via
+the TUI at least once), it works in the sandbox too. `start.bat` checks for
+this credential before launching.
+
+### Disk cleanup (bounded by design)
+
+A persistent conversation owns its DB, so it is *not* deleted after each run.
+To stop those files accumulating, stateful mode wipes its **own** sandbox
+conversations directory (every `*.db`, its SQLite sidecars, and every
+`brain/<id>/` directory under the sandbox) on two occasions:
+
+1. **on startup**, because the in-memory session index starts empty and any
+   `.db` left by a previous run is an unreachable orphan; and
+2. **on any process exit** (graceful shutdown, Ctrl-C, `sys.exit`) — a
+   last-resort `atexit` hook guarantees it even when the graceful-shutdown
+   path doesn't fire.
+
+This dual wipe means stateful **memory never survives a restart**, by design.
+Disk usage cannot grow unbounded.
 
 ## Known Limits
 

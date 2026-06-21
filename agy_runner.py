@@ -23,7 +23,19 @@ class AgyRunResult:
     stderr: str = ""
 
 
-def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
+def run_agy(
+    prompt: str,
+    model: str | None = None,
+    conversation_id: str | None = None,
+    keep: bool = False,
+) -> AgyRunResult:
+    """Run agy once.
+
+    conversation_id: resume an existing agy conversation (stateful sessions) so
+      only the new turn needs to be sent instead of the full history.
+    keep: never delete the conversation DB afterwards (a stateful session owns
+      its lifecycle and needs the memory for later turns).
+    """
     start_time = time.time()
 
     # Validate prerequisites up front so failures name the real culprit instead
@@ -34,7 +46,14 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
     workdir = Path(settings.workdir)
     if not workdir.exists():
         raise RuntimeError(f"agy working directory does not exist: {workdir}")
-    if not settings.conversations_dir.exists():
+    # In stateful mode agy runs inside an isolated home; make sure it exists so
+    # agy can write its data there. (Auth/login still lives in that home — see
+    # the README; log in there once after enabling stateful mode.) The
+    # conversations subdir is ours to create; the real auth state is not.
+    if settings.stateful:
+        settings.stateful_home.mkdir(parents=True, exist_ok=True)
+        settings.conversations_dir.mkdir(parents=True, exist_ok=True)
+    elif not settings.conversations_dir.exists():
         raise RuntimeError(
             f"agy conversations directory does not exist: {settings.conversations_dir} "
             "(is agy installed and logged in?)"
@@ -63,6 +82,8 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
         "--log-file", log_path,
         "--print-timeout", f"{int(settings.request_timeout)}s",
     ]
+    if conversation_id:
+        command.extend(["--conversation", conversation_id])
     if model:
         command.extend(["--model", model])
 
@@ -81,6 +102,7 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
                 errors="replace",
                 timeout=settings.request_timeout + 20,
                 check=False,
+                env=settings.agy_env(),
                 creationflags=creationflags,
             )
         except FileNotFoundError as exc:
@@ -118,6 +140,7 @@ def run_agy(prompt: str, model: str | None = None) -> AgyRunResult:
             # DB — it might be the user's own manual agy conversation.
             if (
                 settings.cleanup_db
+                and not keep
                 and owned_by_us
                 and completed.returncode == 0
                 and not response.truncated
@@ -182,6 +205,12 @@ def _cleanup_conversation(db_path: Path) -> None:
         shutil.rmtree(brain_dir, ignore_errors=True)
 
 
+def cleanup_conversation(conversation_id: str) -> None:
+    """Public: delete a conversation's DB + sidecars + brain dir by id. Used to
+    drop evicted stateful sessions."""
+    _cleanup_conversation(settings.conversations_dir / f"{conversation_id}.db")
+
+
 def sweep_orphan_sidecars() -> int:
     """Delete SQLite sidecar files whose parent .db no longer exists. These are
     pure garbage left behind (e.g. by older cleanup that only removed the .db).
@@ -199,6 +228,37 @@ def sweep_orphan_sidecars() -> int:
                     removed += 1
                 except OSError:
                     pass
+    return removed
+
+
+def sweep_all_conversations() -> int:
+    """Delete EVERY conversation artifact: every *.db (+ its SQLite sidecars)
+    and every brain/<id>/ directory.
+
+    This is the hard reset behind AGY2API_STATEFUL. The session store is pure
+    in-memory, so after a process restart the persistent .db files it kept
+    alive are orphans no eviction can ever reach. To stop them accumulating we
+    wipe the whole directory on startup and on clean shutdown. Stateful memory
+    does not survive a restart anyway, so nothing of value is lost.
+
+    Destructive: also removes conversations the user opened manually in the agy
+    TUI. Acceptable for this personal-use tool; documented in the README.
+
+    Returns the number of *.db files removed."""
+    directory = settings.conversations_dir
+    if not directory.exists():
+        return 0
+    removed = 0
+    for db_path in directory.glob("*.db"):
+        _cleanup_conversation(db_path)
+        if not db_path.exists():  # count only DBs actually deleted
+            removed += 1
+    # brain/<id>/ dirs whose .db we may already have removed (or never existed).
+    brain_dir = directory.parent / "brain"
+    if brain_dir.is_dir():
+        for sub in brain_dir.iterdir():
+            if sub.is_dir():
+                shutil.rmtree(sub, ignore_errors=True)
     return removed
 
 
@@ -238,8 +298,13 @@ def _read_response_with_retry(db_path: Path) -> AgResponse:
             time.sleep(0.2)
 
 
-async def run_agy_async(prompt: str, model: str | None = None) -> AgyRunResult:
-    return await asyncio.to_thread(run_agy, prompt, model)
+async def run_agy_async(
+    prompt: str,
+    model: str | None = None,
+    conversation_id: str | None = None,
+    keep: bool = False,
+) -> AgyRunResult:
+    return await asyncio.to_thread(run_agy, prompt, model, conversation_id, keep)
 
 
 def _snapshot_conversations(directory: Path) -> dict[Path, float]:

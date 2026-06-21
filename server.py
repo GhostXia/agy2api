@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import sys
@@ -13,10 +14,18 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from agy_runner import run_agy_async, sweep_orphan_sidecars
+from pathlib import Path
+
+from agy_runner import (
+    cleanup_conversation,
+    run_agy_async,
+    sweep_all_conversations,
+    sweep_orphan_sidecars,
+)
 from config import is_loopback_host, resolve_model, settings
 from fake_stream import make_heartbeat, sse_event, stream_chunks
 from models import ChatCompletionRequest, ModelInfo, ModelList
+from session_store import SessionStore, fingerprint
 
 
 logger = logging.getLogger("agy2api")
@@ -36,17 +45,118 @@ def _setup_logging() -> None:
 
 _setup_logging()
 
-app = FastAPI(title="agy2api", version="1.0.0")
+app = FastAPI(title="agy2api", version="1.1.0")
 security = HTTPBearer(auto_error=False)
 
 # Limit concurrent agy runs (default 1) to mimic human-paced usage and avoid the
 # concurrent conversation-DB race. See config.max_concurrency.
 _run_semaphore = asyncio.Semaphore(max(1, settings.max_concurrency))
 
+# Experimental stateful-session layer (AGY2API_STATEFUL).
+_session_store = SessionStore(settings.max_sessions) if settings.stateful else None
+_conv_locks: dict[str, asyncio.Lock] = {}
+# Conversations currently being run (resumed). Eviction must not delete these.
+_in_flight: set[str] = set()
 
-async def _run_agy_guarded(prompt: str, model: str | None):
+
+def _stateful_wipe() -> None:
+    """Last-resort cleanup of persistent stateful sessions on exit. Covers the
+    cases the FastAPI shutdown event misses (atexit-level interpreter shutdown,
+    SIGTERM that uvicorn doesn't translate into a graceful shutdown)."""
+    if not settings.stateful:
+        return
+    try:
+        removed = sweep_all_conversations()
+        if removed:
+            logger.info("exit (stateful): wiped %d conversation db(s)", removed)
+    except Exception as exc:
+        logger.warning("exit wipe failed: %s", exc)
+
+
+# atexit runs on normal interpreter exit (covers `python server.py` Ctrl-C /
+# and sys.exit); the FastAPI shutdown event covers graceful uvicorn stop.
+atexit.register(_stateful_wipe)
+
+
+def _conv_lock(conversation_id: str) -> asyncio.Lock:
+    lock = _conv_locks.get(conversation_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _conv_locks[conversation_id] = lock
+    return lock
+
+
+async def _run_agy_guarded(
+    prompt: str, model: str | None, conversation_id: str | None = None, keep: bool = False
+):
     async with _run_semaphore:
-        return await run_agy_async(prompt, model)
+        return await run_agy_async(prompt, model, conversation_id, keep)
+
+
+async def _execute_run(prompt: str, model: str | None, resume_id: str | None, keep: bool):
+    """Run agy, serializing turns of the same resumed conversation so concurrent
+    requests for one chat don't corrupt its session.
+
+    Note: planning (_plan_request) happens before this lock, so two *concurrent*
+    turns of the SAME chat could plan against stale state. OpenAI clients
+    (SillyTavern) serialize turns per chat — they wait for each reply — so this
+    is not hit in practice; concurrent turns of one chat are unsupported."""
+    if resume_id:
+        async with _conv_lock(resume_id):
+            _in_flight.add(resume_id)
+            try:
+                return await _run_agy_guarded(prompt, model, resume_id, keep)
+            finally:
+                _in_flight.discard(resume_id)
+    return await _run_agy_guarded(prompt, model, None, keep)
+
+
+def _msg_sigs(messages: list[Any]) -> list[str]:
+    return [
+        fingerprint(getattr(m, "role", "user"), _content_to_text(getattr(m, "content", "")))
+        for m in messages
+    ]
+
+
+def _plan_request(messages: list[Any]) -> tuple[str, str | None, list[str]]:
+    """Return (prompt_to_send, resume_conversation_id, sigs).
+
+    In stateful mode, if this request continues a known chat, send only the new
+    turn against the existing agy conversation. Otherwise send the full history.
+    """
+    if _session_store is None:
+        return format_messages(messages), None, []
+    sigs = _msg_sigs(messages)
+    plan = _session_store.lookup(sigs)
+    if plan.conversation_id and plan.prefix_len < len(messages):
+        new = messages[plan.prefix_len:]
+        # Drop leading assistant turns — those are agy's own prior replies that
+        # the client echoes back; agy already has them in memory.
+        while new and getattr(new[0], "role", "") == "assistant":
+            new = new[1:]
+        if new:
+            return format_messages(new), plan.conversation_id, sigs
+    return format_messages(messages), None, sigs
+
+
+def _record_session(conversation_id: str, sigs: list[str]) -> None:
+    if _session_store is None or not conversation_id:
+        return
+    for evicted in _session_store.remember(conversation_id, sigs, protected=_in_flight):
+        _conv_locks.pop(evicted, None)  # drop the lock too (no unbounded growth)
+        try:
+            cleanup_conversation(evicted)
+        except Exception as exc:  # housekeeping must not break the request
+            logger.warning("evicted-session cleanup failed for %s: %s", evicted, exc)
+
+
+def _forget_session(resume_id: str | None) -> None:
+    """On a failed resumed turn, drop the session so the NEXT turn rebuilds from
+    full history instead of resuming a conversation that's now wedged. Without
+    this, a broken session keeps failing until the server restarts."""
+    if _session_store is not None and resume_id:
+        _session_store.forget(resume_id)
+        _conv_locks.pop(resume_id, None)
 
 
 async def verify_token(
@@ -71,36 +181,40 @@ async def chat_completions(
     request: Request,
     _: None = Depends(verify_token),
 ):
-    prompt = format_messages(request_body.messages)
     model = request_body.model
     agy_model = resolve_model(model)
+    prompt, resume_id, sigs = _plan_request(request_body.messages)
+    keep = settings.stateful
     logger.info(
-        "request: model=%s (agy=%s) stream=%s messages=%d prompt_chars=%d",
-        model, agy_model, request_body.stream, len(request_body.messages), len(prompt),
+        "request: model=%s (agy=%s) stream=%s messages=%d prompt_chars=%d resume=%s",
+        model, agy_model, request_body.stream, len(request_body.messages),
+        len(prompt), bool(resume_id),
     )
 
     if request_body.stream:
         return StreamingResponse(
-            _stream_response(prompt, model, agy_model, request),
+            _stream_response(prompt, model, agy_model, request, resume_id, keep, sigs),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     started = time.time()
     try:
-        result = await _run_agy_guarded(prompt, agy_model)
+        result = await _execute_run(prompt, agy_model, resume_id, keep)
     except Exception as exc:
+        _forget_session(resume_id)
         logger.error(
             "FAILED (non-stream): model=%s prompt_chars=%d after %.1fs -> %s",
             model, len(prompt), time.time() - started, exc, exc_info=True,
         )
         return _error_response(str(exc), status_code=500)
 
+    _record_session(Path(result.db_path).stem, sigs)
     fr = "length" if result.response.truncated else "stop"
     logger.info(
-        "ok (non-stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s %.1fs",
+        "ok (non-stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s resume=%s %.1fs",
         model, len(result.response.answer), len(result.response.reasoning),
-        result.response.truncated, result.db_path.name, time.time() - started,
+        result.response.truncated, result.db_path.name, bool(resume_id), time.time() - started,
     )
     return JSONResponse(
         content=build_completion_response(
@@ -115,11 +229,32 @@ async def chat_completions(
 @app.on_event("startup")
 async def _startup_sweep() -> None:
     try:
-        removed = sweep_orphan_sidecars()
-        if removed:
-            logger.info("startup: swept %d orphan SQLite sidecar file(s)", removed)
+        if settings.stateful:
+            # Hard reset: the in-memory session store starts empty, so any .db
+            # files kept alive by a previous run are unreachable orphans. Wipe
+            # them now (stateful memory does not survive a restart anyway).
+            removed = sweep_all_conversations()
+            logger.info("startup (stateful): wiped %d conversation db(s)", removed)
+        else:
+            removed = sweep_orphan_sidecars()
+            if removed:
+                logger.info("startup: swept %d orphan SQLite sidecar file(s)", removed)
     except Exception as exc:  # never block startup on housekeeping
         logger.warning("startup sweep failed: %s", exc)
+
+
+@app.on_event("shutdown")
+async def _shutdown_sweep() -> None:
+    # The atexit hook (below) covers normal `python server.py` exit too; this
+    # fires on uvicorn's graceful shutdown signal. Belt-and-suspenders so a
+    # clean stop never leaves orphaned stateful sessions behind.
+    if settings.stateful:
+        try:
+            removed = sweep_all_conversations()
+            if removed:
+                logger.info("shutdown (stateful): wiped %d conversation db(s)", removed)
+        except Exception as exc:  # never block shutdown on housekeeping
+            logger.warning("shutdown sweep failed: %s", exc)
 
 
 @app.get("/health")
@@ -128,10 +263,11 @@ async def health() -> dict[str, str]:
 
 
 async def _stream_response(
-    prompt: str, model: str, agy_model: str | None, request: Request
+    prompt: str, model: str, agy_model: str | None, request: Request,
+    resume_id: str | None = None, keep: bool = False, sigs: list[str] | None = None,
 ) -> AsyncIterator[bytes]:
     started = time.time()
-    task = asyncio.create_task(_run_agy_guarded(prompt, agy_model))
+    task = asyncio.create_task(_execute_run(prompt, agy_model, resume_id, keep))
     try:
         while not task.done():
             if await request.is_disconnected():
@@ -146,15 +282,18 @@ async def _stream_response(
             await asyncio.sleep(1)
 
         result = await task
+        if sigs:
+            _record_session(Path(result.db_path).stem, sigs)
         fr = "length" if result.response.truncated else "stop"
         logger.info(
-            "ok (stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s %.1fs",
+            "ok (stream): model=%s answer_chars=%d reasoning_chars=%d truncated=%s db=%s resume=%s %.1fs",
             model, len(result.response.answer), len(result.response.reasoning),
-            result.response.truncated, result.db_path.name, time.time() - started,
+            result.response.truncated, result.db_path.name, bool(resume_id), time.time() - started,
         )
         async for item in stream_chunks(result.response.answer, result.response.reasoning, model, finish_reason=fr):
             yield item
     except Exception as exc:
+        _forget_session(resume_id)
         logger.error(
             "FAILED (stream): model=%s prompt_chars=%d after %.1fs -> %s",
             model, len(prompt), time.time() - started, exc, exc_info=True,
