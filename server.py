@@ -45,7 +45,7 @@ def _setup_logging() -> None:
 
 _setup_logging()
 
-app = FastAPI(title="agy2api", version="0.1.0")
+app = FastAPI(title="agy2api", version="1.0.0")
 security = HTTPBearer(auto_error=False)
 
 # Limit concurrent agy runs (default 1) to mimic human-paced usage and avoid the
