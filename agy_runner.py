@@ -223,6 +223,36 @@ def sweep_orphan_sidecars() -> int:
     return removed
 
 
+def sweep_all_conversations() -> int:
+    """Delete EVERY conversation artifact: every *.db (+ its SQLite sidecars)
+    and every brain/<id>/ directory.
+
+    This is the hard reset behind AGY2API_STATEFUL. The session store is pure
+    in-memory, so after a process restart the persistent .db files it kept
+    alive are orphans no eviction can ever reach. To stop them accumulating we
+    wipe the whole directory on startup and on clean shutdown. Stateful memory
+    does not survive a restart anyway, so nothing of value is lost.
+
+    Destructive: also removes conversations the user opened manually in the agy
+    TUI. Acceptable for this personal-use tool; documented in the README.
+
+    Returns the number of *.db files removed."""
+    directory = settings.conversations_dir
+    if not directory.exists():
+        return 0
+    removed = 0
+    for db_path in directory.glob("*.db"):
+        _cleanup_conversation(db_path)
+        removed += 1
+    # brain/<id>/ dirs whose .db we may already have removed (or never existed).
+    brain_dir = directory.parent / "brain"
+    if brain_dir.is_dir():
+        for sub in brain_dir.iterdir():
+            if sub.is_dir():
+                shutil.rmtree(sub, ignore_errors=True)
+    return removed
+
+
 def _db_from_log(log_path: str) -> Path | None:
     """Map this run's agy log to its conversation DB via the logged UUID, named
     "<uuid>.db". The DB file can appear a beat after the id is logged, so poll

@@ -100,9 +100,40 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY2API_EXPOSE_REASONING`: emit `reasoning_content`, default `true`
 - `AGY2API_MAX_CONCURRENCY`: max concurrent agy runs, default `3`
 - `AGY2API_CLEANUP_DB`: delete each run's conversation DB + brain dir after reading, default `true`
+- `AGY2API_STATEFUL`: **experimental** — keep a persistent `agy` conversation per chat and send only the new turn each request (instead of resenting the full history every time). Smaller per-turn payloads finish faster and are less likely to trip the upstream ~60s connection cutoff on long chats. Default `false`. See [Stateful mode](#stateful-mode) for the trade-off.
+- `AGY2API_MAX_SESSIONS`: cap on live stateful conversations (LRU-evicted above this), default `200`. Only meaningful with `AGY2API_STATEFUL=1`.
 - `AGY2API_ALLOW_REMOTE`: allow binding a non-loopback host, default `false`
 - `HOST`: bind address, default `127.0.0.1` (see Auth & Privacy / Compliance)
 - `PORT`: server port, default `7862`
+
+## Stateful mode
+
+`AGY2API_STATEFUL=1` keeps one persistent `agy` conversation per chat and
+forwards only the new turn each request, instead of re-sending the full
+history. This shrinks per-turn payloads and makes long chats far less likely
+to hit the upstream connection cutoff.
+
+Because the OpenAI protocol is stateless, this is mapped heuristically: the
+incoming message list is fingerprinted, and if its prefix matches a chat we've
+already forwarded, only the trailing new turn is sent to the existing
+conversation via `agy --conversation <id>`.
+
+**Disk cleanup — destructive.** A persistent conversation owns its DB, so it
+is *not* deleted after each run. To stop those files accumulating, stateful
+mode **wipes the entire conversations directory** (every `*.db`, its SQLite
+sidecars, and every `brain/<id>/` directory) on two occasions:
+
+1. **on startup**, because the in-memory session index starts empty and any
+   `.db` left by a previous run is an unreachable orphan; and
+2. **on any process exit** (graceful shutdown, Ctrl-C, `sys.exit`) — a
+   last-resort `atexit` hook guarantees it even when the graceful-shutdown
+   path doesn't fire.
+
+This dual wipe means stateful **memory never survives a restart**, by design.
+It also means stateful mode **deletes conversations you opened manually in the
+`agy` TUI**, since those live in the same directory. This is accepted for a
+personal, local-use tool. **Do not enable `AGY2API_STATEFUL` on a machine
+where you keep `agy` conversations you cannot afford to lose.**
 
 ## Known Limits
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import sys
@@ -15,7 +16,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from pathlib import Path
 
-from agy_runner import cleanup_conversation, run_agy_async, sweep_orphan_sidecars
+from agy_runner import (
+    cleanup_conversation,
+    run_agy_async,
+    sweep_all_conversations,
+    sweep_orphan_sidecars,
+)
 from config import is_loopback_host, resolve_model, settings
 from fake_stream import make_heartbeat, sse_event, stream_chunks
 from models import ChatCompletionRequest, ModelInfo, ModelList
@@ -49,6 +55,25 @@ _run_semaphore = asyncio.Semaphore(max(1, settings.max_concurrency))
 # Experimental stateful-session layer (AGY2API_STATEFUL).
 _session_store = SessionStore(settings.max_sessions) if settings.stateful else None
 _conv_locks: dict[str, asyncio.Lock] = {}
+
+
+def _stateful_wipe() -> None:
+    """Last-resort cleanup of persistent stateful sessions on exit. Covers the
+    cases the FastAPI shutdown event misses (atexit-level interpreter shutdown,
+    SIGTERM that uvicorn doesn't translate into a graceful shutdown)."""
+    if not settings.stateful:
+        return
+    try:
+        removed = sweep_all_conversations()
+        if removed:
+            logger.info("exit (stateful): wiped %d conversation db(s)", removed)
+    except Exception as exc:
+        logger.warning("exit wipe failed: %s", exc)
+
+
+# atexit runs on normal interpreter exit (covers `python server.py` Ctrl-C /
+# and sys.exit); the FastAPI shutdown event covers graceful uvicorn stop.
+atexit.register(_stateful_wipe)
 
 
 def _conv_lock(conversation_id: str) -> asyncio.Lock:
@@ -182,11 +207,32 @@ async def chat_completions(
 @app.on_event("startup")
 async def _startup_sweep() -> None:
     try:
-        removed = sweep_orphan_sidecars()
-        if removed:
-            logger.info("startup: swept %d orphan SQLite sidecar file(s)", removed)
+        if settings.stateful:
+            # Hard reset: the in-memory session store starts empty, so any .db
+            # files kept alive by a previous run are unreachable orphans. Wipe
+            # them now (stateful memory does not survive a restart anyway).
+            removed = sweep_all_conversations()
+            logger.info("startup (stateful): wiped %d conversation db(s)", removed)
+        else:
+            removed = sweep_orphan_sidecars()
+            if removed:
+                logger.info("startup: swept %d orphan SQLite sidecar file(s)", removed)
     except Exception as exc:  # never block startup on housekeeping
         logger.warning("startup sweep failed: %s", exc)
+
+
+@app.on_event("shutdown")
+async def _shutdown_sweep() -> None:
+    # The atexit hook (below) covers normal `python server.py` exit too; this
+    # fires on uvicorn's graceful shutdown signal. Belt-and-suspenders so a
+    # clean stop never leaves orphaned stateful sessions behind.
+    if settings.stateful:
+        try:
+            removed = sweep_all_conversations()
+            if removed:
+                logger.info("shutdown (stateful): wiped %d conversation db(s)", removed)
+        except Exception as exc:  # never block shutdown on housekeeping
+            logger.warning("shutdown sweep failed: %s", exc)
 
 
 @app.get("/health")
