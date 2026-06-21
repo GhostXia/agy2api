@@ -12,7 +12,19 @@ from proto_decoder import ProtoField, decode_message, find_fields, first_text, r
 USER_STEP_TYPE = 14
 MODEL_STEP_TYPE = 15
 TOOL_STEP_TYPES = {8, 9}
+ERROR_STEP_TYPE = 17
 DONE_STATUS = 3
+
+# Keywords that mark an agy error step (type 17) as an upstream/transport
+# failure worth surfacing verbatim to the caller.
+_ERROR_KEYWORDS = (
+    "model unreachable",
+    "forcibly closed",
+    "terminated due to error",
+    "retryable error",
+    "failed to get load code assist",
+    "stream reading error",
+)
 
 
 @dataclass(frozen=True)
@@ -35,33 +47,43 @@ def read_response(db_path: str | Path) -> AgResponse:
         conn.close()
 
     tool_summaries = _extract_tool_summaries(rows)
-    model_rows = [
-        (idx, payload)
-        for idx, step_type, status, payload in rows
+
+    # Scan ALL completed model rows (newest first) for one that actually carries
+    # an answer. agy can emit several type-15 rows — reasoning-only, empty
+    # terminal markers, etc. — so picking just the last one misses the answer.
+    completed = [
+        payload
+        for _, step_type, status, payload in rows
         if step_type == MODEL_STEP_TYPE and status == DONE_STATUS and isinstance(payload, bytes)
     ]
-    if model_rows:
-        _, payload = model_rows[-1]
+    reasoning_only = ""
+    for payload in reversed(completed):
         answer, reasoning = _extract_model_response(payload)
-        if not answer and not reasoning:
-            raise ValueError(f"model response payload did not contain answer fields in {path}")
-        return AgResponse(
-            answer=answer,
-            reasoning=reasoning,
-            tool_summaries=tuple(tool_summaries),
-            db_path=str(path),
-        )
+        if answer:
+            return AgResponse(
+                answer=answer,
+                reasoning=reasoning,
+                tool_summaries=tuple(tool_summaries),
+                db_path=str(path),
+            )
+        if reasoning and not reasoning_only:
+            reasoning_only = reasoning
 
-    # Degraded read: agy may have been killed mid-generation (e.g. Windows
-    # external kill, agy-side timeout).  A status=2 (in-progress) row can
-    # contain partial text that is still better than a blank error response.
-    incomplete_rows = [
-        (idx, payload)
-        for idx, step_type, status, payload in rows
-        if step_type == MODEL_STEP_TYPE and isinstance(payload, bytes)
+    # No answer anywhere. If agy logged an upstream/transport error (type 17),
+    # surface it verbatim — this is usually a network/proxy drop to Google, not
+    # a parsing problem.
+    error = _extract_error(rows)
+    if error:
+        raise ValueError(f"agy upstream error: {error}")
+
+    # Degraded read: agy killed mid-generation may leave a partial (non-DONE)
+    # row whose text is still better than a blank response.
+    incomplete = [
+        payload
+        for _, step_type, status, payload in rows
+        if step_type == MODEL_STEP_TYPE and status != DONE_STATUS and isinstance(payload, bytes)
     ]
-    if incomplete_rows:
-        _, payload = incomplete_rows[-1]
+    for payload in reversed(incomplete):
         answer, reasoning = _extract_model_response(payload)
         if answer or reasoning:
             return AgResponse(
@@ -71,6 +93,16 @@ def read_response(db_path: str | Path) -> AgResponse:
                 db_path=str(path),
                 truncated=True,
             )
+
+    # Last resort: reasoning was produced but no answer and no explicit error.
+    if reasoning_only:
+        return AgResponse(
+            answer="",
+            reasoning=reasoning_only,
+            tool_summaries=tuple(tool_summaries),
+            db_path=str(path),
+            truncated=True,
+        )
 
     raise ValueError(f"no model response found in {path}")
 
@@ -117,6 +149,24 @@ def _extract_model_response(payload: bytes) -> tuple[str, str]:
     answer = raw_text(response, 1)
     reasoning = raw_text(response, 3)
     return answer, reasoning
+
+
+def _extract_error(rows: list[tuple[int, int, int, bytes]]) -> str:
+    """Pull a concise upstream-error message out of agy error steps (type 17)."""
+    found: list[str] = []
+    for _, step_type, _status, payload in rows:
+        if step_type != ERROR_STEP_TYPE or not isinstance(payload, bytes):
+            continue
+        for text in walk_text(decode_message(payload)):
+            normalized = " ".join(text.split())
+            if len(normalized) < 10:
+                continue
+            low = normalized.lower()
+            if any(kw in low for kw in _ERROR_KEYWORDS):
+                snippet = normalized[:200]
+                if snippet not in found:
+                    found.append(snippet)
+    return " | ".join(found[:2])
 
 
 def _extract_tool_summaries(rows: list[tuple[int, int, int, bytes]]) -> list[str]:
