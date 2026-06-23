@@ -184,6 +184,16 @@ Disk usage cannot grow unbounded.
   to finish sooner, and/or route `*.googleapis.com` through a proxy that allows
   long-lived connections (or direct).
 
+## Maintenance
+
+agy2api parses agy's internals by reverse engineering and pins agy (auto-update
+suppressed), so a new agy build can break it. A scheduled GitHub Actions
+workflow ([.github/workflows/agy-version-watch.yml](.github/workflows/agy-version-watch.yml))
+polls agy's auto-updater endpoint weekly for the latest stable version and, on a
+bump, opens an issue with a re-validation checklist (DB schema, protobuf fields,
+flags, env behaviour). There is no public per-version agy-CLI changelog to
+keyword-scan, so it's a version-bump alert plus a manual checklist — not a diff.
+
 ## License
 
 Apache-2.0. This project is written from scratch and does not copy `gcli2api` code.
