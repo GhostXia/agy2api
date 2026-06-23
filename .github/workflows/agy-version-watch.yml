@@ -1,0 +1,83 @@
+name: agy CLI version watch
+
+# Why: agy2api pins agy (auto-update suppressed) and parses agy internals by
+# reverse engineering. A new agy build can change the conversation DB schema,
+# protobuf field layout, flags, or env behaviour and silently break us. There
+# is no public agy-CLI changelog to keyword-scan, but the auto-updater endpoint
+# reports the latest stable version. This job watches that version and, on a
+# bump, opens an issue with our integration-touchpoint checklist to re-validate.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"   # Mondays 08:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch latest agy CLI stable version
+        id: ver
+        run: |
+          URL="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app"
+          BODY="$(curl -fsS "$URL" || true)"
+          echo "endpoint says: $BODY"
+          VER="$(printf '%s' "$BODY" | grep -oP 'Stable Version:\s*\K[0-9]+(\.[0-9]+)+' || true)"
+          if [ -z "$VER" ]; then
+            echo "::warning::could not parse a version from the updater endpoint; skipping"
+            exit 0
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "detected agy CLI stable version: $VER"
+
+      - name: Open re-validation issue if this version is new
+        if: steps.ver.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          TITLE="agy CLI $VER — re-validate integration"
+          EXISTING="$(gh issue list --state all --search "in:title \"$TITLE\"" --json title --jq '.[].title' || true)"
+          if printf '%s\n' "$EXISTING" | grep -qxF "$TITLE"; then
+            echo "issue already exists for $VER; nothing to do"
+            exit 0
+          fi
+          BODY="$(cat <<'EOF'
+          The agy CLI auto-updater now reports **Stable Version: {{VER}}**.
+
+          agy2api **pins agy** (auto-update suppressed) and reads agy's internals
+          by reverse engineering, so a new agy build can break it. Re-validate the
+          touchpoints below against the new version, then close this issue.
+
+          ### Flags / invocation
+          - [ ] `agy --print ""` still reads the prompt from **stdin**
+          - [ ] `--log-file` still records the conversation UUID
+          - [ ] `--conversation <id>` still resumes a conversation (stateful mode)
+          - [ ] `--print-timeout` still honored
+
+          ### Conversation DB (the parser depends on this)
+          - [ ] DB still at `<home>/.gemini/antigravity-cli/conversations/<uuid>.db`
+          - [ ] `steps` table: `step_type` 14=user / 15=model / 17=error, plus `status` and `step_payload`
+          - [ ] protobuf: prompt `F19.F2`, answer `F20.F1` (raw bytes), reasoning `F20.F3`
+          - [ ] error step (type 17) text still matches the `_ERROR_KEYWORDS` list
+          - [ ] SQLite WAL/`-shm` sidecars still created (cleanup expects them)
+
+          ### Environment / lifecycle
+          - [ ] `USERPROFILE` still relocates agy's home (stateful sandbox isolation)
+          - [ ] login still inherited via the OS credential store
+          - [ ] touching `last_check.timestamp` still suppresses the `--bg-updater` child
+          - [ ] `agy models` label format unchanged (drives `MODEL_MAP`)
+
+          ---
+          Source: the auto-updater endpoint
+          (`https://antigravity-cli-auto-updater-974169037036.us-central1.run.app`).
+          There is no public per-version agy-CLI changelog, so this is a version-bump
+          alert, not a changelog diff — the checklist is the manual review.
+          EOF
+          )"
+          BODY="${BODY//\{\{VER\}\}/$VER}"
+          gh issue create --title "$TITLE" --body "$BODY"
+          echo "opened issue for $VER"
