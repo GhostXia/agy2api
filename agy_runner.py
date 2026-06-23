@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -13,7 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from config import settings
-from conversation_reader import AgResponse, read_response
+from conversation_reader import AgResponse, UpstreamError, read_response
+
+
+# Same logger name as server.py so retry/timeout warnings share one format.
+logger = logging.getLogger("agy2api")
 
 
 @dataclass(frozen=True)
@@ -23,19 +28,33 @@ class AgyRunResult:
     stderr: str = ""
 
 
-def run_agy(
-    prompt: str,
-    model: str | None = None,
-    conversation_id: str | None = None,
-    keep: bool = False,
-) -> AgyRunResult:
-    """Run agy once.
+def _enrich_error(exc: Exception, completed: subprocess.CompletedProcess) -> Exception:
+    """Attach agy's exit status + truncated stderr/stdout to a read/parse error
+    raised after a DB lookup. Previously these diagnostics were only surfaced
+    on the 'no DB found' branch, so an empty/partial DB hid agy's real exit
+    reason (the `no model response found` bug) and forced manual DB probing.
 
-    conversation_id: resume an existing agy conversation (stateful sessions) so
-      only the new turn needs to be sent instead of the full history.
-    keep: never delete the conversation DB afterwards (a stateful session owns
-      its lifecycle and needs the memory for later turns).
+    Re-raises a NEW ValueError with the augmented message so callers that catch
+    by type still work, while log/error responses now carry the cause.
     """
+    stderr = (completed.stderr or "").strip()
+    stdout = (completed.stdout or "").strip()
+    if not stderr and not stdout:
+        return exc  # nothing to add; keep the original untouched
+    enriched = (
+        f"{exc} | agy returncode={completed.returncode} "
+        f"stderr={stderr[:800]!r} stdout={stdout[:800]!r}"
+    )
+    return type(exc)(enriched) if isinstance(exc, ValueError) else RuntimeError(enriched)
+
+
+def _run_agy_once(
+    prompt: str,
+    model: str | None,
+    conversation_id: str | None,
+    keep: bool,
+) -> AgyRunResult:
+    """Run agy exactly once and read the result. See run_agy for retry policy."""
     start_time = time.time()
 
     # Validate prerequisites up front so failures name the real culprit instead
@@ -135,7 +154,14 @@ def run_agy(
             db_path = _find_new_conversation_db(settings.conversations_dir, before, start_time)
 
         if db_path is not None:
-            response = _read_response_with_retry(db_path)
+            try:
+                response = _read_response_with_retry(db_path)
+            except ValueError as exc:
+                # Surface agy's exit status + stderr/stdout alongside the parse
+                # failure. An empty/partial DB used to hide agy's real exit
+                # reason; now log/error responses carry it. UpstreamError is a
+                # ValueError subclass, so its retryable classification survives.
+                raise _enrich_error(exc, completed) from exc
             # Only delete artifacts we positively own (resolved via our log id),
             # on a clean, non-truncated run. Never delete a heuristically-matched
             # DB — it might be the user's own manual agy conversation.
@@ -166,6 +192,55 @@ def run_agy(
             os.remove(log_path)
         except OSError:
             pass
+
+
+# Retry policy for transient upstream failures (Google rate-limit / backend
+# drop / model unreachable). Caps total backoff wait below the per-run budget so
+# one agy attempt always has its full --print-timeout available.
+_UPSTREAM_RETRY_MAX = 3
+_UPSTREAM_BACKOFFS = (2.0, 4.0, 8.0)
+
+
+def run_agy(
+    prompt: str,
+    model: str | None = None,
+    conversation_id: str | None = None,
+    keep: bool = False,
+) -> AgyRunResult:
+    """Run agy, retrying transient upstream errors.
+
+    UpstreamError (rate-limit / backend drop / model unreachable, as classified
+    by conversation_reader._ERROR_KEYWORDS) is retried up to 3 times with
+    exponential backoff (2s/4s/8s). Parse errors, empty-DB failures, config/
+    launch errors, and content-safety rejections are NOT retried — surfacing
+    them immediately is correct and avoids burning quota on a doomed prompt.
+
+    conversation_id: resume an existing agy conversation (stateful sessions) so
+      only the new turn needs to be sent instead of the full history.
+    keep: never delete the conversation DB afterwards (a stateful session owns
+      its lifecycle and needs the memory for later turns).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_UPSTREAM_RETRY_MAX):
+        try:
+            return _run_agy_once(prompt, model, conversation_id, keep)
+        except UpstreamError as exc:
+            last_exc = exc
+            if attempt + 1 < _UPSTREAM_RETRY_MAX:
+                wait = _UPSTREAM_BACKOFFS[min(attempt, len(_UPSTREAM_BACKOFFS) - 1)]
+                logger.warning(
+                    "agy upstream error (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1, _UPSTREAM_RETRY_MAX, wait, exc,
+                )
+                time.sleep(wait)
+            else:
+                logger.warning(
+                    "agy upstream error exhausted %d attempts: %s",
+                    _UPSTREAM_RETRY_MAX, exc,
+                )
+    # Exhausted retries — surface the last upstream error verbatim.
+    assert last_exc is not None
+    raise last_exc
 
 
 _CONVERSATION_ID_RE = re.compile(

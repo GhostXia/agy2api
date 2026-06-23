@@ -36,6 +36,15 @@ class AgResponse:
     truncated: bool = False
 
 
+class UpstreamError(ValueError):
+    """agy/Google transport-side failure worth retrying (rate-limit, transient
+    backend drop, model unreachable). Distinct from parse errors and from
+    content-safety rejections, which are NOT retryable.
+
+    Carried by read_response so agy_runner can decide retry-vs-surface without
+    re-string-matching the message text."""
+
+
 def read_response(db_path: str | Path) -> AgResponse:
     path = Path(db_path)
     conn = sqlite3.connect(path)
@@ -74,7 +83,7 @@ def read_response(db_path: str | Path) -> AgResponse:
     # a parsing problem.
     error = _extract_error(rows)
     if error:
-        raise ValueError(f"agy upstream error: {error}")
+        raise UpstreamError(error)
 
     # Degraded read: agy killed mid-generation may leave a partial (non-DONE)
     # row whose text is still better than a blank response.
