@@ -87,6 +87,13 @@ class Settings:
     # successful read to keep local session files from piling up. Set false to
     # retain them for debugging. (Does NOT reduce server-side conversation count.)
     cleanup_db: bool = _bool_env("AGY2API_CLEANUP_DB", True)
+    # Keep agy's `last_check.timestamp` fresh before each run so agy's background
+    # auto-updater never thinks a check is due. This stops the `agy --bg-updater`
+    # child process from spawning (it flashes its own console window despite our
+    # CREATE_NO_WINDOW) AND prevents agy silently auto-updating underneath us
+    # (which could change the DB/protobuf layout our parser depends on). Set
+    # false to let agy auto-update normally.
+    suppress_autoupdate: bool = _bool_env("AGY2API_SUPPRESS_AUTOUPDATE", True)
     # Experimental: keep a persistent agy conversation per chat and send only the
     # new turn each request (instead of resending the full history). Smaller
     # per-turn payloads finish faster and are less likely to hit an upstream
