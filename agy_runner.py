@@ -39,12 +39,13 @@ def _enrich_error(exc: Exception, completed: subprocess.CompletedProcess) -> Exc
     """
     stderr = (completed.stderr or "").strip()
     stdout = (completed.stdout or "").strip()
-    if not stderr and not stdout:
-        return exc  # nothing to add; keep the original untouched
-    enriched = (
-        f"{exc} | agy returncode={completed.returncode} "
-        f"stderr={stderr[:800]!r} stdout={stdout[:800]!r}"
-    )
+    # Always surface the returncode — it's diagnostic on its own (e.g. -1 =
+    # killed, non-zero = agy error) even when agy printed nothing.
+    enriched = f"{exc} | agy returncode={completed.returncode}"
+    if stderr:
+        enriched += f" stderr={stderr[:800]!r}"
+    if stdout:
+        enriched += f" stdout={stdout[:800]!r}"
     return type(exc)(enriched) if isinstance(exc, ValueError) else RuntimeError(enriched)
 
 
@@ -195,10 +196,34 @@ def _run_agy_once(
 
 
 # Retry policy for transient upstream failures (Google rate-limit / backend
-# drop / model unreachable). Caps total backoff wait below the per-run budget so
-# one agy attempt always has its full --print-timeout available.
+# drop / model unreachable). 3 attempts total = up to 2 retries, waiting 2s then
+# 4s. Kept short so the added latency stays well under the per-run budget and one
+# agy attempt always has its full --print-timeout available.
 _UPSTREAM_RETRY_MAX = 3
-_UPSTREAM_BACKOFFS = (2.0, 4.0, 8.0)
+_UPSTREAM_BACKOFFS = (2.0, 4.0)
+
+# Markers that make an upstream error PERMANENT for the *same* prompt: retrying
+# would re-hit the same wall and only burn quota + latency. Content-safety /
+# policy blocks and hard quota caps live here. Best-effort substring match on the
+# error text (including agy's enriched stderr); unknown phrasings stay retryable.
+_PERMANENT_MARKERS = (
+    "safety",
+    "block_reason",
+    "blocked",
+    "content policy",
+    "policy violation",
+    "prohibited",
+    "quota exceeded",
+    "permission denied",
+    "unauthorized",
+)
+
+
+def _is_permanent_upstream(message: str) -> bool:
+    """True if an upstream error looks permanent for this prompt (content-safety
+    / policy / hard quota), so retrying the same prompt is pointless."""
+    low = message.lower()
+    return any(marker in low for marker in _PERMANENT_MARKERS)
 
 
 def run_agy(
@@ -210,10 +235,11 @@ def run_agy(
     """Run agy, retrying transient upstream errors.
 
     UpstreamError (rate-limit / backend drop / model unreachable, as classified
-    by conversation_reader._ERROR_KEYWORDS) is retried up to 3 times with
-    exponential backoff (2s/4s/8s). Parse errors, empty-DB failures, config/
-    launch errors, and content-safety rejections are NOT retried — surfacing
-    them immediately is correct and avoids burning quota on a doomed prompt.
+    by conversation_reader._ERROR_KEYWORDS) is retried up to 2 times (3 attempts
+    total) with 2s/4s backoff. NOT retried: parse errors, empty-DB failures,
+    config/launch errors, and upstream errors that look permanent for this prompt
+    (content-safety / policy / hard quota, see _is_permanent_upstream) —
+    surfacing those immediately avoids burning quota + latency on a doomed retry.
 
     conversation_id: resume an existing agy conversation (stateful sessions) so
       only the new turn needs to be sent instead of the full history.
@@ -226,6 +252,10 @@ def run_agy(
             return _run_agy_once(prompt, model, conversation_id, keep)
         except UpstreamError as exc:
             last_exc = exc
+            if _is_permanent_upstream(str(exc)):
+                # Same prompt would re-hit the same block — surface immediately.
+                logger.warning("agy upstream error looks permanent; not retrying: %s", exc)
+                raise
             if attempt + 1 < _UPSTREAM_RETRY_MAX:
                 wait = _UPSTREAM_BACKOFFS[min(attempt, len(_UPSTREAM_BACKOFFS) - 1)]
                 logger.warning(
@@ -386,6 +416,12 @@ def _read_response_with_retry(db_path: Path) -> AgResponse:
     while True:
         try:
             return read_response(db_path)
+        except UpstreamError:
+            # agy already exited and wrote an error step — the DB is static, so
+            # re-reading won't change it. Re-raise now and let run_agy decide
+            # whether to retry the whole run (with backoff), instead of burning
+            # the 3s read-retry window here on every attempt.
+            raise
         except ValueError:
             if time.time() >= deadline:
                 raise
