@@ -113,6 +113,7 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY2API_EXPOSE_REASONING`: emit `reasoning_content`, default `true`
 - `AGY2API_MAX_CONCURRENCY`: max concurrent agy runs, default `3`
 - `AGY2API_CLEANUP_DB`: delete each run's conversation DB + brain dir after reading, default `true`
+- `AGY2API_SUPPRESS_AUTOUPDATE`: keep agy's `last_check.timestamp` fresh so its background updater never spawns the `agy --bg-updater` child (a console window that flashes despite `CREATE_NO_WINDOW`), and so agy doesn't silently auto-update and change the DB/protobuf layout the parser relies on, default `true`
 - `AGY2API_STATEFUL`: **experimental** — keep a persistent `agy` conversation per chat and send only the new turn each request (instead of resenting the full history every time). Smaller per-turn payloads finish faster and are less likely to trip the upstream ~60s connection cutoff on long chats. Default `false`. See [Stateful mode](#stateful-mode) for the isolation model.
 - `AGY2API_MAX_SESSIONS`: cap on live stateful conversations (LRU-evicted above this), default `200`. Only meaningful with `AGY2API_STATEFUL=1`.
 - `AGY2API_STATEFUL_HOME`: isolated `agy` home directory used only in stateful mode, default `stateful_home/` inside the project (gitignored). See [Stateful mode](#stateful-mode).

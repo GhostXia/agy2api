@@ -59,6 +59,7 @@ def run_agy(
             "(is agy installed and logged in?)"
         )
 
+    _keep_updater_quiet()
     before = _snapshot_conversations(settings.conversations_dir)
 
     # Per-run unique log file. agy logs its conversation UUID there, and the
@@ -209,6 +210,24 @@ def cleanup_conversation(conversation_id: str) -> None:
     """Public: delete a conversation's DB + sidecars + brain dir by id. Used to
     drop evicted stateful sessions."""
     _cleanup_conversation(settings.conversations_dir / f"{conversation_id}.db")
+
+
+def _keep_updater_quiet() -> None:
+    """Touch agy's `last_check.timestamp` to 'now' so agy's background
+    auto-updater treats the check as fresh and does NOT spawn the
+    `agy --bg-updater` child (which flashes its own console window despite our
+    CREATE_NO_WINDOW, and could silently update agy underneath us). Best-effort;
+    never raises. A future timestamp is treated as invalid by agy, so use now."""
+    if not settings.suppress_autoupdate:
+        return
+    try:
+        marker = settings.conversations_dir.parent / "last_check.timestamp"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+        now = time.time()
+        os.utime(marker, (now, now))
+    except OSError:
+        pass
 
 
 def sweep_orphan_sidecars() -> int:
