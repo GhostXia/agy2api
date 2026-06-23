@@ -162,6 +162,14 @@ def _run_agy_once(
                 # failure. An empty/partial DB used to hide agy's real exit
                 # reason; now log/error responses carry it. UpstreamError is a
                 # ValueError subclass, so its retryable classification survives.
+                #
+                # A FRESH conversation we created that produced no usable
+                # response is throwaway garbage — delete it so failed runs
+                # (especially the retries above) don't accumulate orphan DBs.
+                # Keep resumed-session DBs (the chat's live memory) and keep
+                # everything when cleanup is disabled (debugging).
+                if settings.cleanup_db and owned_by_us and conversation_id is None:
+                    _cleanup_conversation(db_path)
                 raise _enrich_error(exc, completed) from exc
             # Only delete artifacts we positively own (resolved via our log id),
             # on a clean, non-truncated run. Never delete a heuristically-matched
