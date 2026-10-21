@@ -4,13 +4,14 @@ OpenAI-compatible wrapper around the logged-in official Antigravity CLI.
 
 ## What It Does
 
-- Calls `agy --print <prompt>` through `subprocess.run`.
-- Reads the newest Antigravity conversation SQLite DB because `agy` stdout is empty in current builds.
+- Calls `agy --print=<prompt>` with slash-command shields (`--disable-slash-commands`), absolute workspace anchoring (`--add-dir`), and Windows process tree termination (`taskkill`).
+- Reads the newest Antigravity conversation SQLite DB or captures stdout fallback.
 - Decodes protobuf `steps.step_payload` with a small dependency-free wire decoder.
 - Exposes:
-  - `POST /v1/chat/completions`
+  - `POST /v1/chat/completions` (supporting standard OpenAI `reasoning_effort` and reasoning tokens)
   - `GET /v1/models`
 - Supports fake streaming by sending heartbeats while `agy` runs, then chunking the completed answer into OpenAI SSE events.
+- Zero-loss multi-byte character streaming via incremental UTF-8 decoding.
 
 ## Prerequisites
 
@@ -96,7 +97,11 @@ Default URL: `http://127.0.0.1:7862`.
 curl http://127.0.0.1:7862/v1/chat/completions \
   -H "Authorization: Bearer pwd" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"reply with exactly PONG"}]}'
+  -d '{
+    "model": "gemini-3.8-flash",
+    "messages": [{"role": "user", "content": "reply with exactly PONG"}],
+    "reasoning_effort": "low"
+  }'
 ```
 
 ## Configuration
@@ -118,6 +123,9 @@ curl http://127.0.0.1:7862/v1/chat/completions \
 - `AGY2API_MAX_SESSIONS`: cap on live stateful conversations (LRU-evicted above this), default `200`. Only meaningful with `AGY2API_STATEFUL=1`.
 - `AGY2API_STATEFUL_HOME`: isolated `agy` home directory used only in stateful mode, default `stateful_home/` inside the project (gitignored). See [Stateful mode](#stateful-mode).
 - `AGY2API_ALLOW_REMOTE`: allow binding a non-loopback host, default `false`
+- `AGY2API_READ_ONLY`: review mode combining `--sandbox` and `--dangerously-skip-permissions` (discards workspace writes), default `false`
+- `AGY2API_SANDBOX`: run under Antigravity terminal sandbox, default `false`
+- `AGY2API_SKIP_PERMISSIONS`: auto-approve tool permission requests without interactive prompt, default `false`
 - `HOST`: bind address, default `127.0.0.1` (see Auth & Privacy / Compliance)
 - `PORT`: server port, default `7862`
 
@@ -181,9 +189,23 @@ Disk usage cannot grow unbounded.
 - Long replies can fail mid-generation with `agy upstream error: ... connection
   forcibly closed` when a proxy/VPN drops the long-lived connection to Google
   (e.g. a ~60s connection cap). The reasoning phase dominates generation time,
-  so for long chats prefer a low-reasoning model (e.g. `gemini-3.5-flash-low`)
+  so for long chats prefer a low-reasoning model (e.g. `gemini-3.8-flash-low` or `"reasoning_effort": "low"`)
   to finish sooner, and/or route `*.googleapis.com` through a proxy that allows
   long-lived connections (or direct).
+- On Windows, command-line arguments are capped at 32,767 characters by `CreateProcessW`. Fully
+  assembled commands exceeding 32,000 UTF-16 code units (where non-BMP / supplementary Unicode
+  characters count as two code units) trigger an early guard advising the use of stateful mode
+  (`AGY2API_STATEFUL=1`) so only incremental turns are sent.
+
+## Testing
+
+Run the zero-dependency test suite (uses Python's standard library `unittest`):
+
+```powershell
+python run_tests.py -v
+```
+
+All 21 tests execute in ~0.08s and verify model alias/effort resolution, configuration settings, Pydantic requests, real SQLite conversation extraction, stateful session store, fake streaming, and Windows command-line limit detection/cleanup.
 
 ## Maintenance
 

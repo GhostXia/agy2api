@@ -42,20 +42,31 @@ if errorlevel 1 (
 )
 echo [OK] agy login detected.
 
-:: Create virtual environment if not exists
-if not exist "%VENV_DIR%\Scripts\python.exe" (
-    echo [SETUP] Creating virtual environment...
-    !PYTHON! -m venv "%VENV_DIR%"
-    if errorlevel 1 (
-        echo [ERROR] Failed to create virtual environment.
-        goto :fail
-    )
+:: Set Python environment: prefer existing .venv; if absent, use system Python if
+:: requirements are satisfied; otherwise create .venv and install dependencies.
+if exist "%VENV_DIR%\Scripts\python.exe" (
+    set "PYTHON=%VENV_DIR%\Scripts\python.exe"
+    set "PIP=%VENV_DIR%\Scripts\pip.exe"
+    goto :check_deps
 )
 
-:: Set Python to venv
+!PYTHON! -c "import fastapi, uvicorn, pydantic" >nul 2>&1
+if not errorlevel 1 (
+    echo [OK] Using system Python with pre-installed dependencies.
+    goto :select_mode
+)
+
+echo [SETUP] Creating virtual environment...
+!PYTHON! -m venv "%VENV_DIR%"
+if errorlevel 1 (
+    echo [ERROR] Failed to create virtual environment.
+    goto :fail
+)
+
 set "PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "PIP=%VENV_DIR%\Scripts\pip.exe"
 
+:check_deps
 :: Install dependencies if needed
 !PYTHON! -c "import fastapi" >nul 2>&1
 if errorlevel 1 (
@@ -66,6 +77,8 @@ if errorlevel 1 (
         goto :fail
     )
 )
+
+:select_mode
 
 :: Choose mode (default: stateful). Skipped if AGY2API_STATEFUL is already set
 :: in the environment, so callers can force a mode non-interactively.

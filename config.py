@@ -45,23 +45,68 @@ def _csv_env(name: str, default: list[str]) -> list[str]:
 # display labels that `agy models` prints and `agy --model` accepts verbatim.
 # Update this if `agy models` changes its catalog.
 MODEL_MAP: dict[str, str] = {
-    "gemini-3.5-flash": "Gemini 3.5 Flash (Medium)",
-    "gemini-3.5-flash-high": "Gemini 3.5 Flash (High)",
-    "gemini-3.5-flash-low": "Gemini 3.5 Flash (Low)",
-    "gemini-3.1-pro": "Gemini 3.1 Pro (High)",
-    "gemini-3.1-pro-low": "Gemini 3.1 Pro (Low)",
+    "gemini-3.8-flash": "Gemini 3.8 Flash (Medium)",
+    "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
+    "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
+    "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
+    "gemini-3.5-flash": "Gemini 3.8 Flash (Medium)",
+    "gemini-3.5-flash-medium": "Gemini 3.8 Flash (Medium)",
+    "gemini-3.5-flash-high": "Gemini 3.8 Flash (High)",
+    "gemini-3.5-flash-low": "Gemini 3.8 Flash (Low)",
     "claude-sonnet-4.6": "Claude Sonnet 4.6 (Thinking)",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6 (Thinking)",
     "claude-opus-4.6": "Claude Opus 4.6 (Thinking)",
+    "claude-opus-4-6": "Claude Opus 4.6 (Thinking)",
+    "claude-opus-4-6-thinking": "Claude Opus 4.6 (Thinking)",
     "gpt-oss-120b": "GPT-OSS 120B (Medium)",
+    "gpt-oss-120b-medium": "GPT-OSS 120B (Medium)",
 }
 
 
-def resolve_model(model: str | None) -> str | None:
-    """Translate an exposed model id to the agy label. Pass through unknown
-    values unchanged so raw `agy` labels also work directly."""
+# Aliases mapping legacy or alternative ids to canonical model families.
+MODEL_ALIASES: dict[str, str] = {
+    "gemini-3.5-flash": "gemini-3.8-flash",
+    "gemini-3.5-flash-medium": "gemini-3.8-flash",
+    "gemini-3.5-flash-high": "gemini-3.8-flash-high",
+    "gemini-3.5-flash-low": "gemini-3.8-flash-low",
+    "claude-sonnet-4-6": "claude-sonnet-4.6",
+    "claude-opus-4-6": "claude-opus-4.6",
+    "claude-opus-4-6-thinking": "claude-opus-4.6",
+    "gpt-oss-120b-medium": "gpt-oss-120b",
+}
+
+
+def resolve_model(
+    model: str | None, effort: str | None = None
+) -> tuple[str | None, str | None]:
+    """Translate exposed model id and optional effort to (agy_model, agy_effort).
+
+    If the catalog bakes effort into the model name,
+    we select matching variant and drop agy_effort so agy does not exit with
+    '--effort is not supported for model ...'.
+    """
     if not model:
-        return None
-    return MODEL_MAP.get(model, model)
+        return None, effort
+
+    # Normalize alias first (e.g. gemini-3.5-flash -> gemini-3.8-flash)
+    canonical = MODEL_ALIASES.get(model, model)
+
+    effort_str = (effort or "").lower().strip()
+    if effort_str:
+        import re
+
+        base_id = re.sub(r"-(low|medium|high)$", "", canonical)
+        candidate_id = f"{base_id}-{effort_str}"
+        if candidate_id in MODEL_MAP:
+            return MODEL_MAP[candidate_id], None
+
+    resolved = MODEL_MAP.get(canonical, MODEL_MAP.get(model, model))
+    if resolved and any(
+        marker in resolved for marker in ("(Medium)", "(High)", "(Low)", "(Thinking)")
+    ):
+        return resolved, None
+
+    return resolved, effort
 
 
 @dataclass(frozen=True)
@@ -120,9 +165,16 @@ class Settings:
     workdir: Path = Path(
         os.getenv("AGY_WORKDIR", str(Path(__file__).resolve().parent.parent))
     )
+    # Lessons from relay.mjs: sandbox, permission automation, and read-only mode
+    sandbox: bool = _bool_env("AGY2API_SANDBOX", False)
+    dangerously_skip_permissions: bool = _bool_env("AGY2API_SKIP_PERMISSIONS", True)
+    read_only: bool = _bool_env("AGY2API_READ_ONLY", False)
     models: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        if self.read_only:
+            object.__setattr__(self, "sandbox", True)
+            object.__setattr__(self, "dangerously_skip_permissions", True)
         object.__setattr__(
             self,
             "models",
@@ -131,7 +183,9 @@ class Settings:
         # In stateful mode, redirect conversations_dir into the isolated home
         # so agy reads/writes only there (and our sweeps stay self-contained).
         if self.stateful:
-            sandbox_conv = self.stateful_home / ".gemini" / "antigravity-cli" / "conversations"
+            sandbox_conv = (
+                self.stateful_home / ".gemini" / "antigravity-cli" / "conversations"
+            )
             object.__setattr__(self, "conversations_dir", sandbox_conv)
 
     def agy_env(self) -> dict[str, str]:
