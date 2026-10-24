@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatMessage(BaseModel):
@@ -13,11 +13,15 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "gemini-2.5-pro"
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = "gemini-3.8-flash"
     messages: list[ChatMessage]
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    user: str | None = None
 
 
 class ModelInfo(BaseModel):

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -16,9 +18,40 @@ from pathlib import Path
 from config import settings
 from conversation_reader import AgResponse, UpstreamError, read_response
 
+# Lesson from relay.mjs: catch headless auto-denied tool permissions
+_PERMISSION_DENIED_RE = re.compile(
+    r'(?:no output produced\s+[—-]\s+)?a tool required the "([^"]+)" permission that headless\s+mode cannot prompt for',
+    re.IGNORECASE,
+)
 
 # Same logger name as server.py so retry/timeout warnings share one format.
 logger = logging.getLogger("agy2api")
+
+
+class AbortContext:
+    """Thread-safe cancellation context for an in-flight agy run."""
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+        self.aborted: bool = False
+
+    def abort(self) -> None:
+        self.aborted = True
+        proc = self.proc
+        if proc and proc.pid:
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/pid", str(proc.pid), "/t", "/f"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    proc.kill()
+            else:
+                proc.kill()
 
 
 @dataclass(frozen=True)
@@ -28,25 +61,55 @@ class AgyRunResult:
     stderr: str = ""
 
 
-def _enrich_error(exc: Exception, completed: subprocess.CompletedProcess) -> Exception:
-    """Attach agy's exit status + truncated stderr/stdout to a read/parse error
-    raised after a DB lookup. Previously these diagnostics were only surfaced
-    on the 'no DB found' branch, so an empty/partial DB hid agy's real exit
-    reason (the `no model response found` bug) and forced manual DB probing.
+def _crash_diagnostic(returncode: int | None) -> str:
+    """Lesson from relay.mjs: classify process deaths into actionable hints."""
+    if returncode is None:
+        return ""
+    if returncode in (-9, 137):
+        return " [hint: process was killed with SIGKILL; commonly host OOM killer or supervisor timeout]"
+    if returncode in (-15, 143):
+        return " [hint: process was terminated by SIGTERM; manual kill or external supervisor]"
+    if returncode in (-1073741510, -1, 0xC000013A):
+        return " [hint: process was aborted or interrupted by user on Windows]"
+    if returncode in (-1073741819, 0xC0000005):
+        return " [hint: process crashed with memory Access Violation (0xC0000005)]"
+    return ""
 
-    Re-raises a NEW ValueError with the augmented message so callers that catch
-    by type still work, while log/error responses now carry the cause.
+
+def _tail_lines(text: str, max_lines: int = 20) -> str:
+    """Lesson from relay.mjs: ring buffer tail of last max_lines."""
+    lines = [line.rstrip() for line in (text or "").splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
+def _enrich_error(exc: Exception, completed: subprocess.CompletedProcess) -> Exception:
+    """Attach agy's exit status + rolling stderr tail to a read/parse error
+    raised after a DB lookup.
     """
-    stderr = (completed.stderr or "").strip()
-    stdout = (completed.stdout or "").strip()
-    # Always surface the returncode — it's diagnostic on its own (e.g. -1 =
-    # killed, non-zero = agy error) even when agy printed nothing.
-    enriched = f"{exc} | agy returncode={completed.returncode}"
-    if stderr:
-        enriched += f" stderr={stderr[:800]!r}"
-    if stdout:
-        enriched += f" stdout={stdout[:800]!r}"
-    return type(exc)(enriched) if isinstance(exc, ValueError) else RuntimeError(enriched)
+    stderr_tail = _tail_lines(completed.stderr or "", max_lines=20)
+    stdout_tail = _tail_lines(completed.stdout or "", max_lines=10)
+    diag_hint = _crash_diagnostic(completed.returncode)
+
+    enriched = f"{exc} | agy returncode={completed.returncode}{diag_hint}"
+    if stderr_tail:
+        enriched += f" | stderr tail:\n{stderr_tail}"
+    if stdout_tail:
+        enriched += f" | stdout tail:\n{stdout_tail}"
+    return (
+        type(exc)(enriched) if isinstance(exc, ValueError) else RuntimeError(enriched)
+    )
+
+
+def check_windows_command_length(command: list[str]) -> int:
+    """Validate Windows command line length against CreateProcessW's ~32,767 limit."""
+    assembled_cmd = subprocess.list2cmdline(command)
+    utf16_len = len(assembled_cmd.encode("utf-16-le")) // 2
+    if utf16_len > 32_000:
+        raise ValueError(
+            f"Command line length ({utf16_len} UTF-16 code units) exceeds Windows limit (~32KB). "
+            "Please enable stateful mode (AGY2API_STATEFUL=1) to send only incremental turns."
+        )
+    return utf16_len
 
 
 def _run_agy_once(
@@ -54,6 +117,8 @@ def _run_agy_once(
     model: str | None,
     conversation_id: str | None,
     keep: bool,
+    effort: str | None = None,
+    abort_context: AbortContext | None = None,
 ) -> AgyRunResult:
     """Run agy exactly once and read the result. See run_agy for retry policy."""
     start_time = time.time()
@@ -89,43 +154,99 @@ def _run_agy_once(
     log_fd, log_path = tempfile.mkstemp(prefix="agy2api-", suffix=".log")
     os.close(log_fd)
 
-    # The prompt is fed via stdin (with an empty --print value) instead of as a
-    # command-line argument. agy concatenates stdin into the prompt, and stdin
-    # has no length limit, avoiding the Windows ~32767-char command-line cap that
-    # raises WinError 206 for long prompts (system + history).
-    # Give agy its OWN print-timeout equal to our budget, and let our subprocess
-    # timeout sit a margin ABOVE it. That way agy hits its timeout first and
-    # flushes whatever partial response it has (degrade-readable) instead of us
-    # hard-killing it and truncating long replies.
-    command = [
-        settings.agy_path,
-        "--print", "",
-        "--log-file", log_path,
-        "--print-timeout", f"{int(settings.request_timeout)}s",
-    ]
-    if conversation_id:
-        command.extend(["--conversation", conversation_id])
-    if model:
-        command.extend(["--model", model])
-
-    # Windows: suppress the console window that flashes for each agy subprocess.
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-
     try:
+        command = [
+            settings.agy_path,
+            f"--print={prompt}",
+            "--disable-slash-commands",
+            "--log-file",
+            log_path,
+            "--print-timeout",
+            f"{int(settings.request_timeout)}s",
+        ]
+        # Lesson from relay.mjs: explicitly anchor workspace directory via absolute path
+        command.extend(["--add-dir", str(Path(workdir).resolve())])
+        if settings.sandbox:
+            command.append("--sandbox")
+        if settings.dangerously_skip_permissions:
+            command.append("--dangerously-skip-permissions")
+        if conversation_id:
+            command.extend(["--conversation", conversation_id])
+        if model:
+            command.extend(["--model", model])
+        # Lesson from relay.mjs: reasoning effort passed directly to agy --effort
+        if effort:
+            command.extend(["--effort", effort])
+
+        # Lesson from relay.mjs: On Windows, CreateProcessW limits lpCommandLine to ~32,767
+        # UTF-16 code units. Check the fully assembled command line to prevent WinError 206.
+        if os.name == "nt":
+            check_windows_command_length(command)
+
+        # Windows: suppress the console window that flashes for each agy subprocess.
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        )
+
         try:
-            completed = subprocess.run(
+            # Lesson from relay.mjs: read raw bytes and decode using incremental UTF-8
+            # decoder so multi-byte Unicode/Arabic characters are never mangled across chunk boundaries.
+            proc = subprocess.Popen(
                 command,
                 cwd=workdir,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=settings.request_timeout + 20,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=settings.agy_env(),
                 creationflags=creationflags,
             )
+            if abort_context is not None:
+                abort_context.proc = proc
+                if abort_context.aborted:
+                    abort_context.abort()
+                    raise RuntimeError("agy run aborted before completion")
+            try:
+                raw_stdout, raw_stderr = proc.communicate(
+                    timeout=settings.request_timeout + 20
+                )
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                stdout = decoder.decode(raw_stdout, final=True)
+                stderr = decoder.decode(raw_stderr, final=True)
+                completed = subprocess.CompletedProcess(
+                    args=command,
+                    returncode=proc.returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            except subprocess.TimeoutExpired as exc:
+                # Lesson from relay.mjs: forceful tree termination via taskkill on Windows
+                if os.name == "nt" and proc.pid:
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/pid", str(proc.pid), "/t", "/f"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5,
+                            check=False,
+                        )
+                    except Exception:
+                        proc.kill()
+                else:
+                    proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"agy timed out after {settings.request_timeout:g}s"
+                ) from exc
+            finally:
+                # Lesson from relay.mjs: drain & close pipe streams so grandchild processes never hang
+                for stream in (proc.stdout, proc.stderr, proc.stdin):
+                    if stream and not stream.closed:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
         except FileNotFoundError as exc:
             winerror = getattr(exc, "winerror", None)
             diag = (
@@ -135,8 +256,14 @@ def _run_agy_once(
                 f"exc_filename={getattr(exc, 'filename', None)!r}"
             )
             raise RuntimeError(diag) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"agy timed out after {settings.request_timeout:g}s") from exc
+
+        # Lesson from relay.mjs: inspect stderr for headless auto-denied tool permissions
+        perm_match = _PERMISSION_DENIED_RE.search(completed.stderr or "")
+        if perm_match:
+            raise RuntimeError(
+                f"Antigravity auto-denied the '{perm_match.group(1)}' tool permission because "
+                "headless print mode cannot prompt for permissions. Enable AGY2API_SKIP_PERMISSIONS=1 if needed."
+            )
 
         # Attempt to read the conversation DB *before* checking returncode.
         # When agy is killed mid-generation (returncode -1 on Windows, agy-side
@@ -152,7 +279,9 @@ def _run_agy_once(
         owned_by_us = db_path is not None
         if db_path is None:
             # Fallback: log gave no conversation id (older agy?) — pick newest new DB.
-            db_path = _find_new_conversation_db(settings.conversations_dir, before, start_time)
+            db_path = _find_new_conversation_db(
+                settings.conversations_dir, before, start_time
+            )
 
         if db_path is not None:
             try:
@@ -188,14 +317,34 @@ def _run_agy_once(
                 stderr=completed.stderr,
             )
 
-        # No DB found at all — now report the exit status.
-        if completed.returncode != 0:
-            details = completed.stderr.strip() or completed.stdout.strip() or "no output"
-            raise RuntimeError(
-                f"agy exited with code {completed.returncode}: {details} "
-                f"(no conversation DB found; possible agy-side timeout or crash)"
+        # No DB found at all — fallback lesson from relay.mjs: if agy printed to stdout, use it!
+        stdout_text = (completed.stdout or "").strip()
+        if completed.returncode == 0 and stdout_text:
+            return AgyRunResult(
+                db_path=Path(""),
+                response=AgResponse(
+                    answer=stdout_text,
+                    reasoning="",
+                    tool_summaries=(),
+                    db_path="",
+                    truncated=False,
+                ),
+                stderr=completed.stderr,
             )
-        raise RuntimeError("agy completed but no new conversation database was found")
+
+        # Lesson from relay.mjs: reject silent no-op (exit 0 with no response or output)
+        if completed.returncode == 0:
+            raise RuntimeError(
+                "agy exited with code 0 without producing a final message or database response "
+                "(silent no-op). Please verify the prompt and model selection."
+            )
+
+        details = _tail_lines(completed.stderr) or stdout_text or "no output"
+        diag_hint = _crash_diagnostic(completed.returncode)
+        raise RuntimeError(
+            f"agy exited with code {completed.returncode}{diag_hint}: {details} "
+            f"(no conversation DB found; possible agy-side timeout or crash)"
+        )
     finally:
         try:
             os.remove(log_path)
@@ -239,6 +388,8 @@ def run_agy(
     model: str | None = None,
     conversation_id: str | None = None,
     keep: bool = False,
+    effort: str | None = None,
+    abort_context: AbortContext | None = None,
 ) -> AgyRunResult:
     """Run agy, retrying transient upstream errors.
 
@@ -253,28 +404,37 @@ def run_agy(
       only the new turn needs to be sent instead of the full history.
     keep: never delete the conversation DB afterwards (a stateful session owns
       its lifecycle and needs the memory for later turns).
+    effort: reasoning effort level for models that support it (low, medium, high, etc.).
     """
     last_exc: Exception | None = None
     for attempt in range(_UPSTREAM_RETRY_MAX):
         try:
-            return _run_agy_once(prompt, model, conversation_id, keep)
+            return _run_agy_once(
+                prompt, model, conversation_id, keep, effort, abort_context
+            )
         except UpstreamError as exc:
             last_exc = exc
             if _is_permanent_upstream(str(exc)):
                 # Same prompt would re-hit the same block — surface immediately.
-                logger.warning("agy upstream error looks permanent; not retrying: %s", exc)
+                logger.warning(
+                    "agy upstream error looks permanent; not retrying: %s", exc
+                )
                 raise
             if attempt + 1 < _UPSTREAM_RETRY_MAX:
                 wait = _UPSTREAM_BACKOFFS[min(attempt, len(_UPSTREAM_BACKOFFS) - 1)]
                 logger.warning(
                     "agy upstream error (attempt %d/%d), retrying in %.1fs: %s",
-                    attempt + 1, _UPSTREAM_RETRY_MAX, wait, exc,
+                    attempt + 1,
+                    _UPSTREAM_RETRY_MAX,
+                    wait,
+                    exc,
                 )
                 time.sleep(wait)
             else:
                 logger.warning(
                     "agy upstream error exhausted %d attempts: %s",
-                    _UPSTREAM_RETRY_MAX, exc,
+                    _UPSTREAM_RETRY_MAX,
+                    exc,
                 )
     # Exhausted retries — surface the last upstream error verbatim.
     assert last_exc is not None
@@ -380,6 +540,16 @@ def sweep_all_conversations() -> int:
     directory = settings.conversations_dir
     if not directory.exists():
         return 0
+    # Safety invariant: refuse to sweep unless directory is inside stateful_home
+    try:
+        directory.resolve().relative_to(settings.stateful_home.resolve())
+    except ValueError:
+        logger.error(
+            "sweep_all_conversations refused: %s is outside stateful_home %s",
+            directory,
+            settings.stateful_home,
+        )
+        return 0
     removed = 0
     for db_path in directory.glob("*.db"):
         _cleanup_conversation(db_path)
@@ -430,7 +600,7 @@ def _read_response_with_retry(db_path: Path) -> AgResponse:
             # whether to retry the whole run (with backoff), instead of burning
             # the 3s read-retry window here on every attempt.
             raise
-        except ValueError:
+        except (ValueError, sqlite3.OperationalError, sqlite3.DatabaseError):
             if time.time() >= deadline:
                 raise
             time.sleep(0.2)
@@ -441,8 +611,12 @@ async def run_agy_async(
     model: str | None = None,
     conversation_id: str | None = None,
     keep: bool = False,
+    effort: str | None = None,
+    abort_context: AbortContext | None = None,
 ) -> AgyRunResult:
-    return await asyncio.to_thread(run_agy, prompt, model, conversation_id, keep)
+    return await asyncio.to_thread(
+        run_agy, prompt, model, conversation_id, keep, effort, abort_context
+    )
 
 
 def _snapshot_conversations(directory: Path) -> dict[Path, float]:
@@ -467,7 +641,11 @@ def _find_new_conversation_db(
                     mtime = path.stat().st_mtime
                 except OSError:
                     continue
-                if path not in before or mtime > before.get(path, 0) or mtime >= start_time - 1:
+                if (
+                    path not in before
+                    or mtime > before.get(path, 0)
+                    or mtime >= start_time - 1
+                ):
                     candidates.append(path)
 
         if candidates:

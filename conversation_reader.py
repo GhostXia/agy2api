@@ -116,33 +116,6 @@ def read_response(db_path: str | Path) -> AgResponse:
     raise ValueError(f"no model response found in {path}")
 
 
-def read_user_prompt(db_path: str | Path) -> str:
-    path = Path(db_path)
-    conn = sqlite3.connect(path)
-    try:
-        rows = conn.execute(
-            """
-            SELECT step_payload
-            FROM steps
-            WHERE step_type = ? AND status = ?
-            ORDER BY idx
-            """,
-            (USER_STEP_TYPE, DONE_STATUS),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    for (payload,) in rows:
-        if not isinstance(payload, bytes):
-            continue
-        fields = decode_message(payload)
-        for field19 in find_fields(fields, 19):
-            if isinstance(field19.value, list):
-                prompt = first_text(field19.value, 2)
-                if prompt:
-                    return prompt
-    return ""
-
 
 def _extract_model_response(payload: bytes) -> tuple[str, str]:
     fields = decode_message(payload)

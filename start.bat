@@ -42,20 +42,31 @@ if errorlevel 1 (
 )
 echo [OK] agy login detected.
 
-:: Create virtual environment if not exists
-if not exist "%VENV_DIR%\Scripts\python.exe" (
-    echo [SETUP] Creating virtual environment...
-    !PYTHON! -m venv "%VENV_DIR%"
-    if errorlevel 1 (
-        echo [ERROR] Failed to create virtual environment.
-        goto :fail
-    )
+:: Set Python environment: prefer existing .venv; if absent, use system Python if
+:: requirements are satisfied; otherwise create .venv and install dependencies.
+if exist "%VENV_DIR%\Scripts\python.exe" (
+    set "PYTHON=%VENV_DIR%\Scripts\python.exe"
+    set "PIP=%VENV_DIR%\Scripts\pip.exe"
+    goto :check_deps
 )
 
-:: Set Python to venv
+!PYTHON! -c "import fastapi, uvicorn, pydantic" >nul 2>&1
+if not errorlevel 1 (
+    echo [OK] Using system Python with pre-installed dependencies.
+    goto :select_mode
+)
+
+echo [SETUP] Creating virtual environment...
+!PYTHON! -m venv "%VENV_DIR%"
+if errorlevel 1 (
+    echo [ERROR] Failed to create virtual environment.
+    goto :fail
+)
+
 set "PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "PIP=%VENV_DIR%\Scripts\pip.exe"
 
+:check_deps
 :: Install dependencies if needed
 !PYTHON! -c "import fastapi" >nul 2>&1
 if errorlevel 1 (
@@ -66,6 +77,8 @@ if errorlevel 1 (
         goto :fail
     )
 )
+
+:select_mode
 
 :: Choose mode (default: stateful). Skipped if AGY2API_STATEFUL is already set
 :: in the environment, so callers can force a mode non-interactively.
@@ -86,6 +99,35 @@ if not defined AGY2API_STATEFUL (
     )
 )
 
+:: Choose security / tool mode. Skipped if AGY2API_SKIP_PERMISSIONS is already set.
+if not defined AGY2API_SKIP_PERMISSIONS (
+    echo.
+    echo Select security ^& tools mode:
+    echo   [1] Safe Chat  - Quarantined workspace, blocks system commands ^& edits.
+    echo                    Best for general chat / SillyTavern / pure text. ^(default^)
+    echo   [2] Developer  - Enable tools ^& shell execution for coding / transcription.
+    set "SEC_CHOICE="
+    set /p "SEC_CHOICE=Enter choice [1]: "
+    if "!SEC_CHOICE!"=="2" (
+        set "AGY2API_SKIP_PERMISSIONS=1"
+        echo [INFO] Developer / Tools mode enabled.
+        if not defined AGY_WORKDIR (
+            echo.
+            echo Workspace directory for agy [default: %PROJECT_DIR%]:
+            set "USER_WORKDIR="
+            set /p "USER_WORKDIR=Folder path [%PROJECT_DIR%]: "
+            if defined USER_WORKDIR (
+                set "AGY_WORKDIR=!USER_WORKDIR!"
+            ) else (
+                set "AGY_WORKDIR=%PROJECT_DIR%"
+            )
+        )
+    ) else (
+        set "AGY2API_SKIP_PERMISSIONS=0"
+        echo [INFO] Safe Chat mode selected ^(isolated workspace^).
+    )
+)
+
 :: Set default API key if not already configured
 if not defined AGY2API_KEY (
     set "AGY2API_KEY=pwd"
@@ -96,10 +138,16 @@ if not defined AGY2API_KEY (
 echo.
 set "MODE_LABEL=stateless"
 if "!AGY2API_STATEFUL!"=="1" set "MODE_LABEL=stateful"
+set "SEC_LABEL=Safe Chat (isolated)"
+if "!AGY2API_SKIP_PERMISSIONS!"=="1" set "SEC_LABEL=Developer (tools allowed)"
+set "WORKDIR_LABEL=isolated_workspace"
+if defined AGY_WORKDIR set "WORKDIR_LABEL=!AGY_WORKDIR!"
 echo ========================================
 echo   agy2api is starting...
-echo   Mode:    !MODE_LABEL!
-echo   API Key: !AGY2API_KEY!
+echo   Mode:        !MODE_LABEL!
+echo   Security:    !SEC_LABEL!
+echo   Workspace:   !WORKDIR_LABEL!
+echo   API Key:     !AGY2API_KEY!
 echo   Press Ctrl+C to stop.
 echo ========================================
 echo.

@@ -17,6 +17,10 @@ srv.err
 
 # Stateful-mode isolated agy home (contains OAuth/auth state + conversations)
 stateful_home/
+isolated_workspace/
+.env
+.env.*
+!.env.example
 
 # OS / editor
 .DS_Store

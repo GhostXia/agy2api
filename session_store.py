@@ -21,11 +21,11 @@ from dataclasses import dataclass, field
 
 
 def fingerprint(role: str, text: str) -> str:
-    # blake2s (not SHA-1): stronger, collision-resistant identity for matching
-    # chats. 16-byte digest is plenty for this in-memory keyspace.
-    return hashlib.blake2s(
+    # blake2s: collision-resistant identity prefixed with role for matching.
+    digest = hashlib.blake2s(
         f"{role}\n{text}".encode("utf-8", "replace"), digest_size=16
     ).hexdigest()
+    return f"{role}:{digest}"
 
 
 @dataclass
@@ -47,36 +47,68 @@ class Plan:
 class SessionStore:
     def __init__(self, max_sessions: int = 200) -> None:
         self._sessions: dict[str, _Session] = {}
+        self._alias_to_id: dict[str, str] = {}
         # Clamp to >=1 so a misconfigured AGY2API_MAX_SESSIONS (0/negative) can't
         # make _evict delete every session (including the one just added).
         self._max = max(1, max_sessions)
 
-    def lookup(self, sigs: list[str]) -> Plan:
+    def lookup(self, sigs: list[str], session_hint: str | None = None) -> Plan:
         """Find the session whose stored sigs are the LONGEST prefix of `sigs`.
+        Supports explicit session_hint, and tolerates dynamic system message changes.
         Returns a fresh Plan (conversation_id=None) if none qualifies."""
+        if session_hint and session_hint in self._alias_to_id:
+            conv_id = self._alias_to_id[session_hint]
+            sess = self._sessions.get(conv_id)
+            if sess and len(sess.sigs) < len(sigs):
+                sess.last_used = time.time()
+                return Plan(conversation_id=conv_id, prefix_len=len(sess.sigs))
+
         best: _Session | None = None
         for sess in self._sessions.values():
             n = len(sess.sigs)
-            if n < len(sigs) and sigs[:n] == sess.sigs:
-                if best is None or n > len(best.sigs):
-                    best = sess
+            if n >= len(sigs):
+                continue
+            is_match = False
+            if sigs[:n] == sess.sigs:
+                is_match = True
+            elif (
+                n >= 2
+                and sigs[0].startswith("system:")
+                and sess.sigs[0].startswith("system:")
+                and sigs[1:n] == sess.sigs[1:n]
+            ):
+                # Neutralize dynamic system prompt (e.g. injected timestamp in message 0)
+                is_match = True
+
+            if is_match and (best is None or n > len(best.sigs)):
+                best = sess
+
         if best is None:
             return Plan(conversation_id=None, prefix_len=0)
         best.last_used = time.time()
         return Plan(conversation_id=best.conversation_id, prefix_len=len(best.sigs))
 
     def remember(
-        self, conversation_id: str, sigs: list[str], protected: set[str] | None = None
+        self,
+        conversation_id: str,
+        sigs: list[str],
+        protected: set[str] | None = None,
+        session_hint: str | None = None,
     ) -> list[str]:
         """Record the full message history now covered by `conversation_id`.
         Returns conversation_ids evicted (caller should delete their DBs).
         `protected` ids are never evicted (e.g. conversations currently in
         flight in other requests)."""
         self._sessions[conversation_id] = _Session(conversation_id, list(sigs))
+        if session_hint:
+            self._alias_to_id[session_hint] = conversation_id
         return self._evict(protected or set())
 
     def forget(self, conversation_id: str) -> None:
         self._sessions.pop(conversation_id, None)
+        dead_aliases = [k for k, v in self._alias_to_id.items() if v == conversation_id]
+        for k in dead_aliases:
+            self._alias_to_id.pop(k, None)
 
     def _evict(self, protected: set[str]) -> list[str]:
         evicted: list[str] = []
@@ -88,5 +120,10 @@ class SessionStore:
                 break  # everything left is in use; don't evict a live session
             oldest = min(candidates, key=lambda s: s.last_used)
             self._sessions.pop(oldest.conversation_id, None)
+            dead_aliases = [
+                k for k, v in self._alias_to_id.items() if v == oldest.conversation_id
+            ]
+            for k in dead_aliases:
+                self._alias_to_id.pop(k, None)
             evicted.append(oldest.conversation_id)
         return evicted
